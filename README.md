@@ -1,5 +1,8 @@
 # MangaUpdates List Exporter
 
+[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
 A one-click Python tool that exports all your [MangaUpdates](https://www.mangaupdates.com/) lists (Reading, Wish, Complete, Unfinished, On Hold, and custom lists) to JSON files via the official API.
 
 ## Features
