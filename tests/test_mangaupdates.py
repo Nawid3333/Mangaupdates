@@ -62,6 +62,22 @@ class TestSanitizeFilename(unittest.TestCase):
         self.assertNotEqual(a, b)
         self.assertEqual(mu.sanitize_filename(a), mu.sanitize_filename(b))
 
+    def test_extremely_long_title_is_truncated_not_left_to_crash_later(self):
+        """A title long enough to exceed NTFS's ~255 UTF-16-unit path-component
+        limit used to reach save_exports unmodified and crash with OSError 22.
+        Fuzzed and reproduced live before this fix."""
+        name = mu.sanitize_filename("x" * 500)
+        self.assertLessEqual(len(name), 100)
+
+    def test_truncation_is_safe_for_worst_case_surrogate_pair_heavy_titles(self):
+        """Most emoji are astral-plane characters -- 2 UTF-16 units each on
+        Windows -- so the codepoint cap must leave real headroom, not just
+        scrape under the byte limit for plain ASCII."""
+        name = mu.sanitize_filename("🔥" * 500)
+        # 100 codepoints of an astral-plane character is 200 UTF-16 units --
+        # comfortably under 255 with room for a "_N" suffix and ".json".
+        self.assertLessEqual(len(name), 100)
+
 
 # ==================== export_filenames / load_manifest ====================
 class TestExportFilenames(unittest.TestCase):
@@ -72,6 +88,17 @@ class TestExportFilenames(unittest.TestCase):
     def test_mapping_is_order_stable(self):
         titles = ["A", "B", "C"]
         self.assertEqual(mu.export_filenames(titles), mu.export_filenames(list(titles)))
+
+    def test_case_only_difference_is_treated_as_a_collision(self):
+        """On a case-insensitive filesystem (Windows NTFS, default macOS),
+        "Sci-Fi" and "sci-fi" are the SAME file even though they are
+        different strings. Reproduced live before this fix: the second
+        write silently landed on the first list's file and its data was
+        gone with no warning -- the exact corruption class the manifest
+        system exists to prevent, just via case instead of punctuation."""
+        mapping = mu.export_filenames(["Sci-Fi", "sci-fi", "SCI-FI"])
+        names = list(mapping.values())
+        self.assertEqual(len(names), len({n.lower() for n in names}), "must be distinct case-insensitively too")
 
 
 class TestLoadManifest(TempExportsCase):
@@ -119,6 +146,19 @@ class TestFilenameCollisionRegression(TempExportsCase):
         changed = mu.compare_exports(folder2, {"Reading": [_rec(1, "X")]})
         self.assertFalse(changed, "identical export must report no changes")
 
+    def test_case_only_colliding_titles_each_read_back_their_own_data(self):
+        """Same regression as the punctuation-collision test above, but for
+        the case-insensitive-filesystem variant. Uses the real filesystem
+        (TempExportsCase), not just export_filenames in isolation, since the
+        bug only shows up once actual files are written."""
+        a, b = "Sci-Fi", "sci-fi"
+        exports = {a: [_rec(1, "AAA")], b: [_rec(2, "BBB")]}
+        folder = mu.save_exports(exports)
+
+        loaded = mu._load_prev_exports(folder, list(exports.keys()))
+        self.assertEqual(mu.get_series_ids(loaded[a]), {1: "AAA"})
+        self.assertEqual(mu.get_series_ids(loaded[b]), {2: "BBB"})
+
     def test_manifest_less_folder_from_before_this_fix_still_compares(self):
         old_folder = os.path.join(self.dir.name, "01.01.2026_00-00-00")
         os.makedirs(old_folder)
@@ -146,6 +186,19 @@ class TestSaveExports(TempExportsCase):
         with open(os.path.join(folder, mu.MANIFEST_NAME), encoding="utf-8") as f:
             manifest = json.load(f)
         self.assertEqual(set(manifest), {"A", "B"})
+
+    def test_leftover_tmp_folder_from_a_crashed_run_is_cleaned_up(self):
+        """A run that crashes between creating its *.tmp folder and the final
+        os.replace() used to leave that folder behind forever -- nothing
+        else ever revisits it. The next successful run must sweep it away."""
+        stale = os.path.join(self.dir.name, "01.01.2026_00-00-00.tmp")
+        os.makedirs(stale)
+        with open(os.path.join(stale, "partial.json"), "w", encoding="utf-8") as f:
+            f.write("[]")
+
+        mu.save_exports({"Reading": [_rec(1, "X")]})
+
+        self.assertFalse(os.path.isdir(stale), "stale .tmp folder from a previous crash must be swept up")
 
 
 class TestRotateExports(TempExportsCase):
@@ -176,6 +229,39 @@ class TestFindPreviousExport(TempExportsCase):
         prev = mu.find_previous_export(current)
         self.assertEqual(os.path.basename(prev), "02.01.2026_00-00-00")
 
+
+
+# ==================== get_series_ids / get_series_basic robustness ====================
+class TestSeriesExtractionRobustness(unittest.TestCase):
+    """`.get("record", {})` only substitutes its default when the key is
+    *missing*, not when it's present with a null value. A single item
+    anywhere in a list shaped that way -- or not a dict at all -- used to
+    crash with AttributeError and take down export, compare, related-series,
+    and finished-series checks alike, since they all read through these two
+    functions. Fuzzed and reproduced live before this fix."""
+
+    MALFORMED = [
+        None,
+        {},
+        {"record": None},
+        {"record": {}},
+        {"record": {"series": None}},
+        {"record": {"series": {}}},
+        {"record": {"series": {"id": None, "title": "no id"}}},
+        {"record": "not-a-dict"},
+        "not-a-dict-item",
+        42,
+    ]
+
+    def test_get_series_ids_skips_malformed_items_without_crashing(self):
+        good = _rec(1, "Good Series")
+        result = mu.get_series_ids([*self.MALFORMED, good])
+        self.assertEqual(result, {1: "Good Series"})
+
+    def test_get_series_basic_skips_malformed_items_without_crashing(self):
+        good = {"record": {"series": {"id": 1, "title": "Good Series", "url": "https://x/1"}}}
+        result = mu.get_series_basic([*self.MALFORMED, good])
+        self.assertEqual(result, {1: {"title": "Good Series", "url": "https://x/1"}})
 
 
 # ==================== 429 retry behavior ====================
@@ -363,6 +449,38 @@ class TestCollectRelatedSeries(unittest.TestCase):
 
         self.assertEqual(related, {})
 
+    def test_an_unexpectedly_shaped_response_for_one_series_does_not_crash_the_batch(self):
+        """A response body that's valid JSON but not an object (e.g. a bare
+        array) used to raise AttributeError from body.get(...), uncaught,
+        which crashed every OTHER series' result along with it since
+        future.result() re-raises on the aggregating thread. Reproduced live
+        before this fix, including under real concurrent thread-pool load."""
+
+        class ShapeShiftingClient:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, url, **kwargs):
+                sid = int(url.rsplit("/", 1)[-1])
+                self.calls.append(sid)
+                if sid == 999:
+                    return _FakeApiResponse(200, ["unexpected", "array", "body"])
+                return _FakeApiResponse(200, {"related_series": []})
+
+        exports = {
+            "Reading": [
+                _rec(1, "Good Series 1"),
+                _rec(999, "Bad Shape Series"),
+                _rec(2, "Good Series 2"),
+            ]
+        }
+        client = ShapeShiftingClient()
+
+        related = mu.collect_related_series(client, exports)  # must not raise
+
+        self.assertEqual(related, {})
+        self.assertEqual(sorted(client.calls), [1, 2, 999], "the bad-shape series must not abort the others")
+
     def test_lookups_actually_run_concurrently_not_one_at_a_time(self):
         """Proves overlap happened, not just that the result is correct.
 
@@ -528,6 +646,29 @@ class TestFindFinishedWishlistSeries(unittest.TestCase):
         finished = mu.find_finished_wishlist_series(client, wish_items)
 
         self.assertEqual(set(finished), {1})
+
+    def test_an_unexpectedly_shaped_response_for_one_series_does_not_crash_the_batch(self):
+        """Same regression as collect_related_series's equivalent test: a
+        non-dict body for one series must not take the rest down with it."""
+
+        class ShapeShiftingClient:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, url, **kwargs):
+                sid = int(url.rsplit("/", 1)[-1])
+                self.calls.append(sid)
+                if sid == 999:
+                    return _FakeApiResponse(200, ["unexpected", "array", "body"])
+                return _FakeApiResponse(200, {"completed": True, "status": "(Complete)"})
+
+        wish_items = [_rec_url(1, "Good 1"), _rec_url(999, "Bad Shape"), _rec_url(2, "Good 2")]
+        client = ShapeShiftingClient()
+
+        finished = mu.find_finished_wishlist_series(client, wish_items)  # must not raise
+
+        self.assertEqual(set(finished), {1, 2})
+        self.assertEqual(sorted(client.calls), [1, 2, 999])
 
     def test_mixed_format_series_is_not_falsely_flagged(self):
         """Regression guard for the exact trap a naive '"Complete" in status'

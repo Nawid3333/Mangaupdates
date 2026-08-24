@@ -224,6 +224,13 @@ def export_list(client: httpx.Client, list_id: int, title: str) -> list[dict]:
 def sanitize_filename(name: str) -> str:
     """Remove characters unsafe for filenames."""
     safe = re.sub(r'[<>:"/\\|?*]', "_", name).strip().strip(".")
+    # A single path component is capped at 255 UTF-16 units on NTFS (and
+    # similar limits elsewhere). 100 codepoints stays well under that even
+    # in the worst case -- a title made entirely of astral-plane characters
+    # (most emoji), which are 2 UTF-16 units each -- with headroom left for
+    # a "_N" collision suffix and the ".json" extension. An absurdly long
+    # custom list title must be shortened, not crash the whole export.
+    safe = safe[:100].strip().strip(".")
     return safe if safe else "Unnamed_List"
 
 
@@ -243,15 +250,21 @@ def export_filenames(titles) -> dict[str, str]:
     chance for them to disagree.
     """
     mapping: dict[str, str] = {}
-    used: set[str] = set()
+    # Tracked lowercased: two names differing only by case (e.g. "Sci-Fi" vs
+    # "sci-fi") are the *same* file on a case-insensitive filesystem (NTFS,
+    # default macOS). Comparing exact strings here missed that -- the second
+    # write would silently land on the first list's file with no warning,
+    # the exact corruption this manifest system exists to prevent, just via
+    # a different door. Reproduced live before this fix.
+    used_ci: set[str] = set()
     for title in titles:
         base = sanitize_filename(title)
         name = base
         counter = 2
-        while name in used:
+        while name.lower() in used_ci:
             name = f"{base}_{counter}"
             counter += 1
-        used.add(name)
+        used_ci.add(name.lower())
         mapping[title] = name
     return mapping
 
@@ -291,6 +304,20 @@ def save_exports(exports: dict[str, list[dict]]) -> str:
         shutil.rmtree(tmp_folder_path)
     os.makedirs(tmp_folder_path, exist_ok=True)
 
+    # A run that crashed between creating its own *.tmp folder and the final
+    # os.replace() below leaves that folder behind forever -- nothing else
+    # ever revisits it, since a future run's tmp path only collides with it
+    # by reusing the exact same second-resolution timestamp. Sweep for any
+    # other leftover *.tmp directories here so a crash doesn't permanently
+    # clutter exports/ with orphaned partial data.
+    if os.path.isdir(EXPORTS_DIR):
+        for entry in os.listdir(EXPORTS_DIR):
+            entry_path = os.path.join(EXPORTS_DIR, entry)
+            if entry_path != tmp_folder_path and entry.endswith(".tmp") and os.path.isdir(entry_path):
+                with contextlib.suppress(OSError):
+                    shutil.rmtree(entry_path)
+                    log.info("Cleaned up leftover partial export from a previous run: %s", entry)
+
     filenames = export_filenames(list(exports.keys()))
     for title, items in exports.items():
         unique_title = filenames[title]
@@ -307,16 +334,37 @@ def save_exports(exports: dict[str, list[dict]]) -> str:
     return folder_path
 
 
+def _extract_series(item) -> dict | None:
+    """Pull the `record.series` dict out of one list item, or None if the
+    shape doesn't hold up.
+
+    `.get("record", {})` only substitutes the default when the key is
+    *missing* -- a key present with a null value (or the item itself being
+    null, or not a dict at all) still passed None on through to the next
+    `.get()` call and crashed with AttributeError. The API has never sent
+    that shape, but a single such item anywhere in a list used to be able to
+    take down the entire run (export, compare, related-series, and
+    finished-series checks all go through this).
+    """
+    if not isinstance(item, dict):
+        return None
+    record = item.get("record") or {}
+    if not isinstance(record, dict):
+        return None
+    series = record.get("series") or {}
+    return series if isinstance(series, dict) else None
+
+
 def get_series_ids(items: list[dict]) -> dict[int, str]:
     """Extract {series_id: title} from a list export."""
     result = {}
     for item in items:
-        record = item.get("record", {})
-        series = record.get("series", {})
+        series = _extract_series(item)
+        if series is None:
+            continue
         sid = series.get("id")
-        title = series.get("title", "Unknown")
         if sid is not None:
-            result[sid] = title
+            result[sid] = series.get("title", "Unknown")
     return result
 
 
@@ -324,7 +372,9 @@ def get_series_basic(items: list[dict]) -> dict[int, dict]:
     """Extract {series_id: {"title", "url"}} from a list export."""
     result = {}
     for item in items:
-        series = item.get("record", {}).get("series", {})
+        series = _extract_series(item)
+        if series is None:
+            continue
         sid = series.get("id")
         if sid is not None:
             result[sid] = {"title": series.get("title", "Unknown"), "url": series.get("url", "")}
@@ -375,14 +425,22 @@ def fetch_series_related(client: httpx.Client, series_id: int) -> list[dict] | N
             log.warning("Series id %s no longer exists on MangaUpdates — skipping", series_id)
             return None
         resp.raise_for_status()
-        return resp.json().get("related_series", [])
-    except (httpx.HTTPError, ValueError) as exc:
-        # httpx.HTTPError covers every transport/status failure _api_request
-        # can raise; ValueError catches a malformed JSON body (json.JSONDecodeError
-        # is a ValueError subclass). Either way this is one series failing to
-        # look up, not a reason to abort the whole related-series pass -- the
-        # 404 case above already gets the same treatment, this just closes the
-        # same hole for every other way a single lookup can go wrong.
+        body = resp.json()
+        if not isinstance(body, dict):
+            raise ValueError(f"unexpected response shape: {type(body).__name__}")
+        return body.get("related_series", [])
+    except Exception as exc:
+        # Deliberately broad: this runs as one task among hundreds inside a
+        # thread pool (collect_related_series), and the contract of a single
+        # lookup here is "never take the whole batch down". httpx.HTTPError
+        # covers transport/status failures and ValueError covers a malformed
+        # JSON body, but a response shaped unexpectedly (e.g. a JSON array
+        # instead of an object) raised AttributeError from body.get(...)
+        # here, which neither of those caught -- reproduced live, this one
+        # series then crashed every other series' result along with it since
+        # future.result() re-raises on the aggregating thread. The 404 case
+        # above already gets the same "skip, don't abort" treatment; this
+        # closes the same hole for every other way one lookup can go wrong.
         log.warning("Could not fetch related series for id %s: %s", series_id, exc)
         return None
 
@@ -521,8 +579,13 @@ def fetch_series_status(client: httpx.Client, series_id: int) -> dict | None:
             return None
         resp.raise_for_status()
         data = resp.json()
+        if not isinstance(data, dict):
+            raise ValueError(f"unexpected response shape: {type(data).__name__}")
         return {"completed": bool(data.get("completed", False)), "status": data.get("status", "") or ""}
-    except (httpx.HTTPError, ValueError) as exc:
+    except Exception as exc:
+        # Deliberately broad -- same reasoning as fetch_series_related: one
+        # task among many in a thread pool, must never take the whole batch
+        # down over a single unexpectedly-shaped response.
         log.warning("Could not fetch status for id %s: %s", series_id, exc)
         return None
 

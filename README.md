@@ -10,13 +10,14 @@ A menu-driven Python tool for your [MangaUpdates](https://www.mangaupdates.com/)
 - **Menu-driven** — run `main.py`, see your logged-in account and API reachability up front, then pick what to do
 - **Option 1 — Scan my lists**: exports every list and reports what was added, removed, or moved since the last run
   - **Dynamic list discovery** — picks up custom lists, not just the 5 defaults
-  - **Safe against duplicate list names** — two lists that reduce to the same filename (e.g. `Sci-Fi/Fantasy` and `Sci-Fi_Fantasy`) are kept on separate files and compared correctly, tracked by a manifest written alongside each export
+  - **Safe against duplicate list names** — two lists that reduce to the same filename (e.g. `Sci-Fi/Fantasy` and `Sci-Fi_Fantasy`, or `Sci-Fi` and `sci-fi` on a case-insensitive filesystem) are kept on separate files and compared correctly, tracked by a manifest written alongside each export
   - **Auto-rotation** — keeps the last 3 exports, deletes older ones
   - **Crash-safe writes** — an export is built in a temporary folder and only revealed under its final name once every file has been written, so an interrupted run can never leave a half-written folder behind for the next run to compare against
 - **Option 2 — Related series**: looks up every series' MangaUpdates "Related Series" section and reports anything not already in one of your lists to `exports/related.txt`, overwritten fresh each run
 - **Option 3 — Ready to read**: checks every series on your Wish List against MangaUpdates' own completion flag and reports the ones that have finished releasing (including cancelled/discontinued — nothing more is coming there either) to `exports/ready_to_read.txt`, overwritten fresh each run. A series still mid-release in any format (e.g. an ongoing webtoon re-release of an otherwise-complete print run) is correctly left out
 - **Concurrent lookups** — options 2 and 3 both make one API request per series, run concurrently across `SERIES_LOOKUP_WORKERS` threads; the API doesn't charge for either endpoint, so there's no reason to do it one at a time
 - **Retries transient failures**, including rate limiting (`429`), honoring the API's `Retry-After` header when it sends one
+- **Resilient to unexpected data** — a single malformed API response, missing field, or oddly-shaped list item is skipped and logged, never aborting the whole batch; fuzz-tested against randomized malformed input and 250-series concurrent runs with injected failures
 
 ## Example Output
 
@@ -157,7 +158,7 @@ Settings can be adjusted in `config/config.py`:
 python -m pytest tests -q
 ```
 
-Runs offline — no credentials or network access needed. Covers filename collision handling, the export manifest, crash-safety of `save_exports`, export rotation, the retry/rate-limit logic, related-series discovery (including a genuine wall-clock concurrency proof, not just a correctness check), and the Wish List completion check (including the mixed-format trap where one release format says "Complete" while another is still active).
+Runs offline — no credentials or network access needed. Covers filename collision handling (including the case-insensitive-filesystem variant), the export manifest, crash-safety of `save_exports` (including recovering from a previous crashed run's leftover files), export rotation, the retry/rate-limit logic, related-series discovery (including a genuine wall-clock concurrency proof, not just a correctness check), the Wish List completion check (including the mixed-format trap where one release format says "Complete" while another is still active), and resilience to malformed API responses and list items.
 
 ## Requirements
 
