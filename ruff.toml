@@ -1,0 +1,13 @@
+line-length = 120
+indent-width = 4
+
+[format]
+quote-style = "double"
+indent-style = "space"
+
+[lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
+fixable = ["ALL"]
+
+[lint.pydocstyle]
+convention = "google"
