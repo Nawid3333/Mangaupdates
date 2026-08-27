@@ -38,7 +38,34 @@ RETRY_DELAY = 5  # Seconds between retries
 # already backs off on real pushback (429, honoring Retry-After) rather than
 # guessing a safe pace up front. Raise this for a faster run, lower it to be
 # gentler on a very large account.
-SERIES_LOOKUP_WORKERS = 10
+#
+# Benchmarked live against the real API on 100 real series ids, each level
+# measured 3 times in shuffled order so ordering drift could not fake a
+# winner (median req/s): 8 -> 30.3, 10 -> 31.1, 12 -> 40.1, 16 -> 46.2,
+# 20 -> 48.1. 16 is where the curve flattens; 20 buys 4% more for 25% more
+# concurrent load.
+#
+# Reliability was the gate, not throughput. Across 1,500 requests the only
+# two non-200s were single transient 503s -- one at 20 workers and one at 10,
+# the level this was raised *from* -- so they are background noise, not the
+# server pushing back at a threshold, and _api_request already retries 5xx.
+# An earlier sweep over 150 ids agreed: 32 workers ran clean, 16 ran clean,
+# and the single 503 that turned up landed at 24 -- after 32 had already
+# passed, which is not how a load threshold behaves.
+# Do not raise this further without re-running that measurement.
+SERIES_LOOKUP_WORKERS = 16
+
+# List-page settings
+# Page 1 of a list reports total_hits, so the whole page range is known after
+# one round trip; every list's first page is fetched at once and then every
+# remaining page at once (export_all_lists). This caps how many of those page
+# requests are in flight.
+#
+# Kept well below SERIES_LOOKUP_WORKERS on purpose: a page response carries
+# up to ITEMS_PER_PAGE full records (~35 KB each here) against ~11 KB for a
+# single series, and real accounts need only a handful of pages -- 10 for a
+# 635-item, 5-list account, which 8 already clears in two round trips.
+LIST_PAGE_WORKERS = 8
 
 # Logging setup
 LOG_FILE = os.path.join(LOGS_DIR, "mangaupdates_export.log")

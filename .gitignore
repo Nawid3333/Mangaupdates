@@ -54,3 +54,7 @@ desktop.ini
 /logs/
 *.log
 
+
+# Coverage output
+.coverage
+htmlcov/

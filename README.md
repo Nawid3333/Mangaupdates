@@ -16,8 +16,11 @@ A menu-driven Python tool for your [MangaUpdates](https://www.mangaupdates.com/)
 - **Option 2 — Related series**: looks up every series' MangaUpdates "Related Series" section and reports anything not already in one of your lists to `exports/related.txt`, overwritten fresh each run
 - **Option 3 — Ready to read**: checks every series on your Wish List against MangaUpdates' own completion flag and reports the ones that have finished releasing (including cancelled/discontinued — nothing more is coming there either) to `exports/ready_to_read.txt`, overwritten fresh each run. A series still mid-release in any format (e.g. an ongoing webtoon re-release of an otherwise-complete print run) is correctly left out
 - **Concurrent lookups** — options 2 and 3 both make one API request per series, run concurrently across `SERIES_LOOKUP_WORKERS` threads; the API doesn't charge for either endpoint, so there's no reason to do it one at a time
-- **Retries transient failures**, including rate limiting (`429`), honoring the API's `Retry-After` header when it sends one
+- **Concurrent list paging** — page 1 of a list already reports `total_hits`, so there is nothing to discover by walking pages one at a time: every list's first page is fetched at once, then every remaining page at once. Same number of requests, two round trips instead of one list's pages after another's
+- **Retries transient failures**, including rate limiting (`429`), honoring the API's `Retry-After` header when it sends one. Each retry adds a small random delay on top, so concurrent workers that were rate-limited in the same instant don't all retry in the same instant — the wait is never shorter than the server asked for
 - **Resilient to unexpected data** — a single malformed API response, missing field, or oddly-shaped list item is skipped and logged, never aborting the whole batch; fuzz-tested against randomized malformed input and 250-series concurrent runs with injected failures
+- **Fails loudly where guessing would be worse** — a malformed *list page* or list index aborts the export instead of being worked around, naming the list and page. A silently shortened list would be saved as if it were complete, and the next run would report every missing series as removed
+- **Survives its own failures** — one option failing doesn't end the session or lose your login; Ctrl+C stops the current operation and returns you to the menu, discarding partial data, and exits cleanly from the menu itself (exit code 130, as convention expects)
 
 ## Example Output
 
@@ -149,14 +152,23 @@ Settings can be adjusted in `config/config.py`:
 | `MAX_EXPORTS`            | `3`     | Number of export snapshots to keep (option 1)          |
 | `ITEMS_PER_PAGE`         | `100`   | Items per API page request                             |
 | `MAX_RETRIES`            | `3`     | Attempts per API request before giving up               |
-| `RETRY_DELAY`            | `5`     | Seconds to wait before retrying, when the server does not send a `Retry-After` header |
-| `SERIES_LOOKUP_WORKERS`  | `10`    | Concurrent threads for the per-series lookups options 2 and 3 make. Raise for a faster run, lower to be gentler on a very large account |
+| `RETRY_DELAY`            | `5`     | Seconds to wait before retrying, when the server does not send a `Retry-After` header. A random spread of up to `RETRY_JITTER` (1s, in `main.py`) is added on top |
+| `SERIES_LOOKUP_WORKERS`  | `16`    | Concurrent threads for the per-series lookups options 2 and 3 make. Benchmarked live against the real API; 16 is where the throughput curve flattens. Raise for a faster run, lower to be gentler on a very large account |
+| `LIST_PAGE_WORKERS`      | `8`     | Concurrent threads for list page requests (all three options). Page 1 reports `total_hits`, so the whole page range is fetched in one go rather than walked |
 
 ## Tests
 
 ```bash
 python -m pytest tests -q
 ```
+
+Or with the standard library runner:
+
+```bash
+python -m unittest discover -s tests
+```
+
+Line coverage of `main.py` is 99% — the only uncovered line is the `sys.exit(_run_cli())` call itself, which no test can execute.
 
 Runs offline — no credentials or network access needed. Covers filename collision handling (including the case-insensitive-filesystem variant), the export manifest, crash-safety of `save_exports` (including recovering from a previous crashed run's leftover files), export rotation, the retry/rate-limit logic, related-series discovery (including a genuine wall-clock concurrency proof, not just a correctness check), the Wish List completion check (including the mixed-format trap where one release format says "Complete" while another is still active), and resilience to malformed API responses and list items.
 

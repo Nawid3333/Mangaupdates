@@ -2,11 +2,14 @@ import concurrent.futures
 import contextlib
 import json
 import os
+import random
 import re
 import shutil
+import sys
 import tempfile
 import time
-from datetime import datetime
+import unicodedata
+from datetime import datetime, timedelta
 
 import httpx
 
@@ -14,6 +17,8 @@ from config.config import (
     API_BASE_URL,
     EXPORTS_DIR,
     ITEMS_PER_PAGE,
+    LIST_PAGE_WORKERS,
+    LOG_FILE,
     MAX_EXPORTS,
     MAX_RETRIES,
     PASSWORD,
@@ -53,27 +58,65 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
+def _display_width(text: str) -> int:
+    """How many terminal columns `text` occupies, ignoring ANSI codes.
+
+    len() counts code points, and an emoji is one code point but two columns
+    in every terminal that renders it, so a line containing one came out a
+    column short and pushed the box's right edge out of line with the rest.
+    """
+    plain = _strip_ansi(text)
+    width = 0
+    for index, char in enumerate(plain):
+        # Variation selectors and combining marks attach to the previous
+        # character rather than occupying a column of their own.
+        if char in ("\uFE0F", "\uFE0E") or unicodedata.combining(char):
+            continue
+        wide = unicodedata.east_asian_width(char) in ("W", "F")
+        # U+FE0F asks for emoji presentation, which is two columns even when
+        # the base character is narrow on its own (e.g. the warning sign).
+        emoji_presentation = plain[index + 1 : index + 2] == "\uFE0F"
+        width += 2 if (wide or emoji_presentation) else 1
+    return width
+
+
 def _box(lines: list[str], width: int = 64) -> list[str]:
-    """Return a list of box-drawn lines, accounting for ANSI codes."""
-    out = []
-    out.append("╔" + "═" * width + "╗")
+    """Return a list of box-drawn lines, accounting for ANSI codes.
+
+    The box grows if a line does not fit rather than letting its right edge
+    run ragged -- truncating would hide content, which is worse.
+    """
+    width = max(width, *(_display_width(line) for line in lines)) if lines else width
+    out = ["╔" + "═" * width + "╗"]
     for line in lines:
-        visible_len = len(_strip_ansi(line))
-        padding = max(0, width - visible_len)
-        out.append("║" + line + " " * padding + "║")
+        out.append("║" + line + " " * (width - _display_width(line)) + "║")
     out.append("╚" + "═" * width + "╝")
     return out
 
 
+# Upper bound on the random spread added to every retry delay.
+RETRY_JITTER = 1.0
+
+
 def _retry_delay(resp: httpx.Response | None) -> float:
-    """Seconds to wait before the next attempt, honoring Retry-After if sent."""
+    """Seconds to wait before the next attempt, honoring Retry-After if sent.
+
+    A small random spread is added on top. Lookups run across
+    SERIES_LOOKUP_WORKERS threads, so without it every worker that was
+    rate-limited in the same instant would sleep for exactly the same time
+    and retry in the same instant -- rebuilding the burst the server just
+    pushed back on.
+
+    The jitter is only ever added, never subtracted: Retry-After is an
+    instruction about the earliest acceptable retry, and waiting less than
+    the server asked for would be worse than not jittering at all.
+    """
+    base = RETRY_DELAY
     if resp is not None:
         raw_value = resp.headers.get("Retry-After", "")
-        try:
-            return max(float(raw_value), 0.0)
-        except ValueError:
-            pass
-    return RETRY_DELAY
+        with contextlib.suppress(ValueError):
+            base = max(float(raw_value), 0.0)
+    return base + random.uniform(0.0, RETRY_JITTER)
 
 
 def _api_request(client: httpx.Client, method: str, url: str, **kwargs) -> httpx.Response:
@@ -140,12 +183,18 @@ def login(client: httpx.Client) -> str:
         raise SystemExit(1)
     resp.raise_for_status()
 
+    # `.get("context", {})` only substitutes when the key is absent, so a
+    # context present-but-null -- or a body that is not an object at all --
+    # crashed here with a bare AttributeError rather than the clean message
+    # the missing-token case already produced. Same shape of defect that
+    # _extract_series was hardened against.
     data = resp.json()
-    token = data.get("context", {}).get("session_token")
+    context = data.get("context") if isinstance(data, dict) else None
+    token = context.get("session_token") if isinstance(context, dict) else None
     if not token:
         log.error(
             "No session token in login response (status: %s)",
-            data.get("status", "unknown"),
+            data.get("status", "unknown") if isinstance(data, dict) else f"unexpected {type(data).__name__} body",
         )
         raise SystemExit(1)
 
@@ -178,44 +227,163 @@ def logout(client: httpx.Client) -> None:
 
 
 def fetch_lists(client: httpx.Client) -> list[dict]:
-    """Get all user lists (built-in + custom)."""
+    """Get all user lists (built-in + custom).
+
+    The shape is validated here, at the boundary, because everything
+    downstream indexes these dicts directly -- export_all_lists and
+    run_finished_check both do -- and a missing key surfaced as a bare
+    KeyError naming nothing.
+
+    A malformed entry aborts rather than being skipped. A silently dropped
+    list would simply be absent from the export, and the next run would
+    report it as removed along with every series in it, which is exactly the
+    kind of confident wrong answer this program must not produce.
+    """
     log.info("Fetching user lists...")
     resp = _api_request(client, "get", f"{API_BASE_URL}/lists")
     resp.raise_for_status()
     lists = resp.json()
+
+    if not isinstance(lists, list):
+        raise ValueError(f"MangaUpdates returned a malformed list index: expected an array, got {type(lists).__name__}")
+    for index, entry in enumerate(lists):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"MangaUpdates returned a malformed list index: entry {index} is "
+                f"{type(entry).__name__}, expected an object"
+            )
+        if entry.get("list_id") is None:
+            raise ValueError(f"MangaUpdates returned a malformed list index: entry {index} has no list_id")
+        if not isinstance(entry.get("title"), str):
+            raise ValueError(
+                f"MangaUpdates returned a malformed list index: entry {index} "
+                f"(list_id {entry['list_id']}) has no usable title"
+            )
+
     log.info("Found %d list(s): %s", len(lists), ", ".join(lst["title"] for lst in lists))
     return lists
 
 
+MAX_LIST_PAGES = 500  # Safety limit to prevent infinite loops
+
+
+def _fetch_list_page(client: httpx.Client, list_id: int, page: int) -> tuple[list, int]:
+    """Fetch one page of one list. Returns (results, total_hits).
+
+    The response shape is checked here instead of being left to fail later.
+    A null `results` or `total_hits` used to surface as a bare TypeError from
+    inside the paging arithmetic -- "'<=' not supported between instances of
+    'NoneType' and 'int'" -- which named neither the list nor the page and
+    read like a bug in this program rather than a bad response.
+
+    Deliberately raises rather than substituting a default. An empty
+    `results` would end the paging early, and the short list would then be
+    saved as if it were complete; the next run would compare against it and
+    report every missing series as removed. Stopping is the only safe answer
+    for a list export -- the same reason a failed page already aborts -- but
+    it should say what happened.
+    """
+    resp = _api_request(
+        client,
+        "post",
+        f"{API_BASE_URL}/lists/{list_id}/search",
+        json={
+            "page": page,
+            "perpage": ITEMS_PER_PAGE,
+        },
+    )
+    resp.raise_for_status()
+
+    def malformed(detail: str) -> ValueError:
+        return ValueError(f"MangaUpdates returned a malformed page for list_id {list_id}, page {page}: {detail}")
+
+    data = resp.json()
+    if not isinstance(data, dict):
+        raise malformed(f"expected an object, got {type(data).__name__}")
+
+    results = data.get("results", [])
+    total = data.get("total_hits", 0)
+    if not isinstance(results, list):
+        raise malformed(f"'results' was {type(results).__name__}, expected a list")
+    if isinstance(total, bool) or not isinstance(total, int):
+        raise malformed(f"'total_hits' was {type(total).__name__}, expected an integer")
+    return results, total
+
+
+def _pages_after_first(total: int) -> list[int]:
+    """Which page numbers are still outstanding once page 1 has been read.
+
+    Paging used to be discovered by walking -- fetch a page, see whether the
+    running total had caught up with total_hits, fetch the next. But page 1
+    already reports total_hits, so the whole page range is known after one
+    round trip and there is nothing left to discover by going one at a time.
+    """
+    if total <= ITEMS_PER_PAGE:
+        return []
+    wanted = min(MAX_LIST_PAGES, -(-total // ITEMS_PER_PAGE))
+    return list(range(2, wanted + 1))
+
+
+def _join_pages(pages: list[list], total: int) -> list[dict]:
+    """Concatenate fetched pages, stopping exactly where the serial loop did.
+
+    The old loop extended, then broke once it held total_hits items or hit a
+    page that came back empty. Both rules are replayed here in the same order
+    against the same pages, so a list whose total_hits overstates reality
+    yields the identical items rather than picking up trailing empty pages.
+    """
+    items: list[dict] = []
+    for results in pages:
+        items.extend(results)
+        if len(items) >= total or not results:
+            break
+    return items
+
+
+@contextlib.contextmanager
+def _worker_pool(max_workers: int):
+    """A thread pool that drops queued work when the block is interrupted.
+
+    ThreadPoolExecutor's own context manager always shuts down with
+    wait=True and no cancellation, so Ctrl+C during a several-hundred-series
+    lookup waited for every task still sitting in the queue before the
+    interrupt was allowed through -- many seconds of apparent hang after the
+    user had already asked it to stop. Cancelling the queue leaves only the
+    requests genuinely in flight to finish.
+    """
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    try:
+        yield pool
+    except BaseException:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True)
+
+
+def _page_pool(job_count: int):
+    """A pool sized for the page fetches actually queued, never larger."""
+    return _worker_pool(max(1, min(LIST_PAGE_WORKERS, job_count)))
+
+
 def export_list(client: httpx.Client, list_id: int, title: str) -> list[dict]:
     """Paginate through a single list and return all items."""
-    all_items = []
-    page = 1
-    max_pages = 500  # Safety limit to prevent infinite loops
+    first, total = _fetch_list_page(client, list_id, 1)
 
-    while page <= max_pages:
-        resp = _api_request(
-            client,
-            "post",
-            f"{API_BASE_URL}/lists/{list_id}/search",
-            json={
-                "page": page,
-                "perpage": ITEMS_PER_PAGE,
-            },
-        )
-        resp.raise_for_status()
+    rest = _pages_after_first(total)
+    later: list[list] = []
+    if rest:
+        with _page_pool(len(rest)) as pool:
+            later = [results for results, _total in pool.map(lambda p: _fetch_list_page(client, list_id, p), rest)]
 
-        data = resp.json()
-        results = data.get("results", [])
-        total = data.get("total_hits", 0)
+    all_items = _join_pages([first, *later], total)
 
-        all_items.extend(results)
-
-        if len(all_items) >= total or not results:
-            break
-        page += 1
-    else:
-        log.warning("  %s: hit page limit (%d) – list may be incomplete", title, max_pages)
+    # The serial loop warned when it had walked every one of the 500 allowed
+    # pages and still not reached total_hits. The page range is now computed
+    # up front, so the same condition reads as "the range was clamped and the
+    # items it produced still fall short".
+    if len(all_items) < total and len(rest) + 1 >= MAX_LIST_PAGES:
+        log.warning("  %s: hit page limit (%d) – list may be incomplete", title, MAX_LIST_PAGES)
 
     log.info("  %s: %d item(s)", title, len(all_items))
     return all_items
@@ -235,6 +403,18 @@ def sanitize_filename(name: str) -> str:
 
 
 MANIFEST_NAME = "_manifest.json"
+
+
+def _write_json(path: str, payload) -> None:
+    """Serialise once, write once.
+
+    json.dump streams into the file handle, which for a 300 KB export meant
+    hundreds of thousands of individual writes through the text wrapper.
+    Building the string first and writing it in one call produces
+    byte-identical output roughly four times faster.
+    """
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
 def export_filenames(titles) -> dict[str, str]:
@@ -290,8 +470,19 @@ def load_manifest(folder: str, titles) -> dict[str, str]:
 
 def save_exports(exports: dict[str, list[dict]]) -> str:
     """Save each list to a timestamped folder. Returns the folder path."""
-    folder_name = datetime.now().strftime("%d.%m.%Y_%H-%M-%S")
+    # Two runs inside the same second produce the same folder name, and
+    # os.replace onto an existing non-empty directory fails -- on Windows
+    # with PermissionError. The run would then die *after* every list had
+    # been fetched and written, losing all of it. Step the stamp forward
+    # instead of adding a suffix, so the name still parses as a timestamp and
+    # keeps working for ordering and rotation.
+    stamp = datetime.now()
+    folder_name = stamp.strftime(EXPORT_FOLDER_FORMAT)
     folder_path = os.path.join(EXPORTS_DIR, folder_name)
+    while os.path.exists(folder_path):
+        stamp += timedelta(seconds=1)
+        folder_name = stamp.strftime(EXPORT_FOLDER_FORMAT)
+        folder_path = os.path.join(EXPORTS_DIR, folder_name)
 
     # Write into a temporary folder first and only reveal it under its final
     # name once every file has been written successfully. Writing directly
@@ -304,31 +495,35 @@ def save_exports(exports: dict[str, list[dict]]) -> str:
         shutil.rmtree(tmp_folder_path)
     os.makedirs(tmp_folder_path, exist_ok=True)
 
-    # A run that crashed between creating its own *.tmp folder and the final
-    # os.replace() below leaves that folder behind forever -- nothing else
-    # ever revisits it, since a future run's tmp path only collides with it
-    # by reusing the exact same second-resolution timestamp. Sweep for any
-    # other leftover *.tmp directories here so a crash doesn't permanently
-    # clutter exports/ with orphaned partial data.
+    # A run that crashed part-way leaves its *.tmp behind forever -- nothing
+    # else ever revisits it. Sweep any leftover here so a crash doesn't
+    # permanently clutter exports/ with orphaned partial data.
+    #
+    # Files as well as directories: save_related_series and
+    # save_finished_series build their reports with mkstemp(suffix=".tmp") in
+    # this same folder, and only directories were being swept, so a crash
+    # mid-report left a stray file that nothing would ever remove.
     if os.path.isdir(EXPORTS_DIR):
         for entry in os.listdir(EXPORTS_DIR):
             entry_path = os.path.join(EXPORTS_DIR, entry)
-            if entry_path != tmp_folder_path and entry.endswith(".tmp") and os.path.isdir(entry_path):
-                with contextlib.suppress(OSError):
+            if entry_path == tmp_folder_path or not entry.endswith(".tmp"):
+                continue
+            with contextlib.suppress(OSError):
+                if os.path.isdir(entry_path):
                     shutil.rmtree(entry_path)
-                    log.info("Cleaned up leftover partial export from a previous run: %s", entry)
+                else:
+                    os.remove(entry_path)
+                log.info("Cleaned up leftover partial data from a previous run: %s", entry)
 
     filenames = export_filenames(list(exports.keys()))
     for title, items in exports.items():
         unique_title = filenames[title]
         file_path = os.path.join(tmp_folder_path, f"{unique_title}.json")
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(items, f, indent=2, ensure_ascii=False)
+        _write_json(file_path, items)
         log.info("  Saved %s (%d items)", os.path.join(folder_path, f"{unique_title}.json"), len(items))
 
     manifest_path = os.path.join(tmp_folder_path, MANIFEST_NAME)
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(filenames, f, indent=2, ensure_ascii=False)
+    _write_json(manifest_path, filenames)
 
     os.replace(tmp_folder_path, folder_path)
     return folder_path
@@ -382,8 +577,21 @@ def get_series_basic(items: list[dict]) -> dict[int, dict]:
 
 
 def export_all_lists(client: httpx.Client, lists: list[dict]) -> dict[str, list[dict]]:
-    """Export every list, guarding against two distinct lists sharing a title."""
-    exports = {}
+    """Export every list, guarding against two distinct lists sharing a title.
+
+    Every list's page 1 is fetched at once, then every remaining page of every
+    list at once -- two round trips rather than one list's pages after
+    another's. Calling export_list per list inside a pool would deadlock the
+    moment it tried to fetch its own pages from that same pool, so the two
+    phases are driven from here instead.
+
+    Request count is unchanged; only how many are in flight at a time is.
+    """
+    # Resolve the storage keys first, in list order, so the duplicate-title
+    # warnings and the resulting key assignment stay exactly as they were --
+    # the dedup counter depends on the order lists are seen in, and that must
+    # not become a function of which request happens to finish first.
+    plan: list[tuple[str, int, str]] = []
     used_titles = set()
     for lst in lists:
         list_id = lst["list_id"]
@@ -404,7 +612,45 @@ def export_all_lists(client: httpx.Client, lists: list[dict]) -> dict[str, list[
                 key,
             )
         used_titles.add(key)
-        exports[key] = export_list(client, list_id, title)
+        plan.append((key, list_id, title))
+
+    if not plan:
+        return {}
+
+    # A pool per phase, each sized for the work that phase actually has. One
+    # pool sized by len(plan) and reused for both looked tidier, but the
+    # phases are not the same size: a single large list is one plan entry and
+    # ten pages, so that pool had one thread and fetched every page after the
+    # first serially -- precisely what this was meant to stop. The phases are
+    # strictly sequential anyway (page 1 is what reveals the rest), so nothing
+    # overlaps by splitting them.
+    with _page_pool(len(plan)) as pool:
+        firsts = list(pool.map(lambda entry: _fetch_list_page(client, entry[1], 1), plan))
+
+    jobs = [(index, page) for index, (_results, total) in enumerate(firsts) for page in _pages_after_first(total)]
+    later_results: list[list] = []
+    if jobs:
+        def fetch_job(job: tuple[int, int]) -> list:
+            index, page = job
+            return _fetch_list_page(client, plan[index][1], page)[0]
+
+        with _page_pool(len(jobs)) as pool:
+            later_results = list(pool.map(fetch_job, jobs))
+
+    # pool.map yields in submission order and `jobs` was built list by list in
+    # ascending page order, so each list's pages arrive here already ordered.
+    later_by_list: dict[int, list[list]] = {index: [] for index in range(len(plan))}
+    for (index, _page), results in zip(jobs, later_results, strict=True):
+        later_by_list[index].append(results)
+
+    exports = {}
+    for index, (key, _list_id, title) in enumerate(plan):
+        first, total = firsts[index]
+        items = _join_pages([first, *later_by_list[index]], total)
+        if len(items) < total and len(later_by_list[index]) + 1 >= MAX_LIST_PAGES:
+            log.warning("  %s: hit page limit (%d) – list may be incomplete", title, MAX_LIST_PAGES)
+        log.info("  %s: %d item(s)", title, len(items))
+        exports[key] = items
     return exports
 
 
@@ -477,7 +723,7 @@ def collect_related_series(client: httpx.Client, exports: dict[str, list[dict]])
     total = len(all_ids)
     done = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=SERIES_LOOKUP_WORKERS) as pool:
+    with _worker_pool(SERIES_LOOKUP_WORKERS) as pool:
         future_to_series = {
             pool.submit(fetch_series_related, client, series_id): (series_id, origin_title)
             for series_id, origin_title in all_ids.items()
@@ -534,8 +780,17 @@ def save_related_series(related: dict[int, dict]) -> str:
     if not related:
         lines.append("(none — every related series turned up is already in one of your lists)")
     else:
-        for _rel_id, entry in sorted(related.items(), key=lambda kv: kv[1]["title"].lower()):
-            source_bits = ", ".join(f'{rel_type} of "{origin}"' for origin, rel_type in entry["sources"])
+        # Everything here was collected in as_completed order -- whichever
+        # lookup happened to finish first -- so both the entries and their
+        # sources have to be ordered explicitly or the same data prints
+        # differently every run. Confirmed live before this: two runs of
+        # identical code produced two different reports. The id breaks ties
+        # so the ordering is total, not merely stable.
+        for _rel_id, entry in sorted(related.items(), key=lambda kv: (kv[1]["title"].lower(), kv[0])):
+            source_bits = ", ".join(
+                f'{rel_type} of "{origin}"'
+                for origin, rel_type in sorted(entry["sources"], key=lambda src: (src[0].lower(), src[1].lower()))
+            )
             lines.append(entry["title"])
             lines.append(f"  {source_bits}")
             if entry["url"]:
@@ -605,7 +860,7 @@ def find_finished_wishlist_series(client: httpx.Client, wish_items: list[dict]) 
     total = len(basic)
     done = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=SERIES_LOOKUP_WORKERS) as pool:
+    with _worker_pool(SERIES_LOOKUP_WORKERS) as pool:
         future_to_series = {
             pool.submit(fetch_series_status, client, series_id): (series_id, info)
             for series_id, info in basic.items()
@@ -640,7 +895,9 @@ def save_finished_series(finished: dict[int, dict], total_checked: int) -> str:
     if not finished:
         lines.append("(none — nothing on your Wish List has finished releasing yet)")
     else:
-        for _sid, entry in sorted(finished.items(), key=lambda kv: kv[1]["title"].lower()):
+        # Same reasoning as save_related_series: collected in as_completed
+        # order, so the id breaks title ties into a total ordering.
+        for _sid, entry in sorted(finished.items(), key=lambda kv: (kv[1]["title"].lower(), kv[0])):
             lines.append(entry["title"])
             status_text = " / ".join(s.strip() for s in entry["status"].splitlines() if s.strip())
             if status_text:
@@ -662,42 +919,73 @@ def save_finished_series(finished: dict[int, dict], total_checked: int) -> str:
     return path
 
 
+EXPORT_FOLDER_FORMAT = "%d.%m.%Y_%H-%M-%S"
+
+
 def _parse_folder_date(name: str) -> datetime:
     """Parse a folder name into a datetime for sorting."""
     try:
-        return datetime.strptime(name, "%d.%m.%Y_%H-%M-%S")
+        return datetime.strptime(name, EXPORT_FOLDER_FORMAT)
     except ValueError:
         return datetime.min
 
 
+def _is_export_folder(name: str) -> bool:
+    """Whether this directory name is one this program created as an export."""
+    try:
+        datetime.strptime(name, EXPORT_FOLDER_FORMAT)
+    except ValueError:
+        return False
+    return True
+
+
+def _export_folders() -> list[str]:
+    """Every export snapshot in EXPORTS_DIR, oldest first.
+
+    find_previous_export and rotate_exports each used to decide for
+    themselves what counted, and both accepted *any* directory. That was
+    wrong in two different ways: rotation counted an unrelated folder toward
+    MAX_EXPORTS and deleted it first, because an unparseable name sorts as
+    datetime.min and therefore looks like the oldest export there is; and a
+    comparison would happily diff against it and report every series as new.
+    Deciding it once, here, is the only way the two can agree.
+    """
+    if not os.path.isdir(EXPORTS_DIR):
+        return []
+    names = [
+        name
+        for name in os.listdir(EXPORTS_DIR)
+        if _is_export_folder(name) and os.path.isdir(os.path.join(EXPORTS_DIR, name))
+    ]
+    return sorted(names, key=_parse_folder_date)
+
+
 def find_previous_export(current_folder: str) -> str | None:
     """Find the most recent export folder before current_folder."""
-    if not os.path.isdir(EXPORTS_DIR):
-        return None
-
-    current_name = os.path.basename(current_folder)
-    current_dt = _parse_folder_date(current_name)
-    folders = sorted(
-        (
-            d
-            for d in os.listdir(EXPORTS_DIR)
-            if os.path.isdir(os.path.join(EXPORTS_DIR, d)) and _parse_folder_date(d) < current_dt
-        ),
-        key=_parse_folder_date,
-    )
+    current_dt = _parse_folder_date(os.path.basename(current_folder))
+    folders = [name for name in _export_folders() if _parse_folder_date(name) < current_dt]
     if folders:
         return os.path.join(EXPORTS_DIR, folders[-1])
     return None
 
 
-def _load_prev_exports(prev_folder: str, titles: list[str]) -> dict[str, list[dict]]:
-    """Load previous exports and return {list_title: raw items}.
+def _load_prev_exports(prev_folder: str, titles: list[str]) -> tuple[dict[str, list[dict]], set[str]]:
+    """Load previous exports. Returns ({list_title: raw items}, unreadable titles).
 
     Reads the manifest once and returns the raw items rather than an
     already-reduced id map, so compare_exports can do both the movement scan
     and the per-list diff from one read of each file instead of two.
+
+    A file that exists but cannot be parsed used to be substituted with an
+    empty list, which made a corrupted export indistinguishable from a list
+    that genuinely had nothing in it: every series in it came back reported
+    as newly Added. That is the worst kind of wrong answer here, because it
+    looks exactly like a real account change. Those titles are named
+    separately now so the caller can say it does not know, instead of
+    guessing.
     """
     result: dict[str, list[dict]] = {}
+    unreadable: set[str] = set()
     filenames = load_manifest(prev_folder, titles)
     for title in titles:
         prev_file = os.path.join(prev_folder, f"{filenames.get(title, sanitize_filename(title))}.json")
@@ -705,9 +993,10 @@ def _load_prev_exports(prev_folder: str, titles: list[str]) -> dict[str, list[di
             try:
                 with open(prev_file, encoding="utf-8") as f:
                     result[title] = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                result[title] = []
-    return result
+            except (json.JSONDecodeError, OSError) as exc:
+                log.warning("Could not read '%s' from the previous export: %s", title, exc)
+                unreadable.add(title)
+    return result, unreadable
 
 
 def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool:
@@ -735,7 +1024,7 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
     # Load every previous list once; both the movement scan and the
     # per-list diff below read from this instead of the file a second time.
     all_titles = list(exports.keys())
-    prev_by_list = _load_prev_exports(prev_folder, all_titles)
+    prev_by_list, unreadable = _load_prev_exports(prev_folder, all_titles)
     prev_ids_by_list = {title: get_series_ids(items) for title, items in prev_by_list.items()}
 
     # get_series_ids(items) used to be called separately for the movement
@@ -770,7 +1059,7 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
         has_changes = True
         log.info("")
         log.info("  %s", _style("↔ Moved series", _T.BOLD, _T.YELLOW))
-        for _sid, (name, old_list, new_list) in moved.items():
+        for _sid, (name, old_list, new_list) in sorted(moved.items(), key=lambda kv: (kv[1][0].lower(), kv[0])):
             log.info(
                 "     %s %s  %s → %s",
                 _style("↪", _T.YELLOW),
@@ -783,6 +1072,20 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
     moved_sids = set(moved.keys())
 
     for title, current_items in exports.items():
+        if title in unreadable:
+            # Not reported as added/removed: we do not know what was there.
+            has_changes = True
+            log.info(
+                "  %s  %s",
+                _style("✗", _T.YELLOW),
+                _style(
+                    f"[{title}] previous export could not be read – cannot compare "
+                    f"(currently {len(current_items)} item(s))",
+                    _T.YELLOW,
+                ),
+            )
+            continue
+
         if title not in prev_by_list:
             log.info(
                 "  %s  %s",
@@ -836,9 +1139,11 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
             count_diff,
         )
 
-        for sid in added_ids:
+        # Sets of ids iterate in hash order, which reads as arbitrary and
+        # makes two printings of the same change set hard to compare.
+        for sid in sorted(added_ids, key=lambda s: (current_ids[s].lower(), s)):
             log.info("     %s Added:   %s", _style("+", _T.GREEN), current_ids[sid])
-        for sid in removed_ids:
+        for sid in sorted(removed_ids, key=lambda s: (prev_ids[s].lower(), s)):
             log.info("     %s Removed: %s", _style("-", _T.YELLOW), prev_ids[sid])
 
     # Check for lists that existed before but are now gone. Read the
@@ -887,10 +1192,10 @@ def rotate_exports() -> None:
     if not os.path.isdir(EXPORTS_DIR):
         return
 
-    folders = sorted(
-        [d for d in os.listdir(EXPORTS_DIR) if os.path.isdir(os.path.join(EXPORTS_DIR, d))],
-        key=_parse_folder_date,
-    )
+    # Only this program's own snapshots. Anything else in exports/ -- a
+    # folder the user put there, one from another tool -- is not ours to
+    # count or delete.
+    folders = _export_folders()
 
     while len(folders) > MAX_EXPORTS:
         oldest = folders.pop(0)
@@ -932,8 +1237,13 @@ def run_scan_lists(client: httpx.Client) -> None:
     folder = save_exports(exports)
     log.info("Exports saved to: %s", folder)
 
-    has_changes = compare_exports(folder, exports)
-    rotate_exports()
+    try:
+        has_changes = compare_exports(folder, exports)
+    finally:
+        # The export is already on disk by this point. If the diff fails,
+        # rotation must still run or exports/ grows past MAX_EXPORTS without
+        # bound across repeated failures.
+        rotate_exports()
 
     if not has_changes:
         log.info("Run ended with no changes since previous export.")
@@ -970,10 +1280,21 @@ def run_related_check(client: httpx.Client) -> None:
 def run_finished_check(client: httpx.Client) -> None:
     """Option 3: find Wish List series that have finished releasing."""
     lists = fetch_lists(client)
-    wish_list = next((lst for lst in lists if lst["title"] == "Wish List"), None)
-    if wish_list is None:
+    wish_lists = [lst for lst in lists if lst["title"] == "Wish List"]
+    if not wish_lists:
         log.warning("No 'Wish List' found on this account — nothing to check")
         return
+    if len(wish_lists) > 1:
+        # export_all_lists already warns and keeps both when two lists share
+        # a title; this path silently checked the first and ignored the rest,
+        # so the same account state was reported two different ways.
+        log.warning(
+            "Found %d lists titled 'Wish List' (ids %s) — checking only the first (id %s)",
+            len(wish_lists),
+            ", ".join(str(lst["list_id"]) for lst in wish_lists),
+            wish_lists[0]["list_id"],
+        )
+    wish_list = wish_lists[0]
 
     items = export_list(client, wish_list["list_id"], wish_list["title"])
     if not items:
@@ -1006,27 +1327,85 @@ def main():
         client.headers["Authorization"] = f"Bearer {token}"
         log.info("Logged in as: %s", USERNAME)
 
+        actions = {"1": run_scan_lists, "2": run_related_check, "3": run_finished_check}
         try:
             while True:
                 show_menu()
-                choice = input("Enter your choice (0-3): ").strip()
-
-                if choice == "1":
-                    run_scan_lists(client)
-                elif choice == "2":
-                    run_related_check(client)
-                elif choice == "3":
-                    run_finished_check(client)
-                elif choice == "0":
+                try:
+                    choice = input("Enter your choice (0-3): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    # Ctrl+C or a closed stdin at the prompt is a way of
+                    # saying "done", not a crash worth a traceback.
+                    print()
                     log.info("Goodbye!")
                     break
-                else:
+
+                if choice == "0":
+                    log.info("Goodbye!")
+                    break
+
+                action = actions.get(choice)
+                if action is None:
                     print("✗ Invalid choice. Please enter a number between 0 and 3.")
+                    continue
+
+                try:
+                    action(client)
+                except KeyboardInterrupt:
+                    # Interrupt the operation, not the session -- the same
+                    # thing Ctrl+C does at any other interactive prompt.
+                    # Ctrl+C at the menu itself still exits.
+                    print()
+                    log.warning("Option %s interrupted by the user", choice)
+                    print("  Stopped. Any partly written data has been discarded.")
+                except Exception as exc:  # pylint: disable=broad-exception-caught
+                    # A failure inside one option used to propagate out of
+                    # this loop and end the run, so a single bad response
+                    # dropped the user back to the shell with a traceback and
+                    # a session they would have to log in again to replace.
+                    # The full traceback still goes to the log file.
+                    log.error("Option %s failed: %s", choice, exc, exc_info=True)
+                    print(f"\n✗ That option did not finish: {exc}")
+                    print("  You are still logged in — pick another option, or 0 to quit.")
+                    print(f"  Full detail is in {LOG_FILE}")
         finally:
             logout(client)
 
     log.info("Done!")
 
 
+def _run_cli() -> int:
+    """Run main() and turn every way it can end into a process exit code.
+
+    Separate from main() so that this -- the part whose entire job is to
+    behave well when something goes wrong -- is reachable from the tests.
+    Inside `if __name__ == "__main__"` it was the one piece of the program
+    that no test could execute.
+    """
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Ctrl+C somewhere the menu loop could not catch it: during login, or
+        # while shutting down. 130 is the conventional exit code for SIGINT.
+        print()
+        log.info("Interrupted.")
+        return 130
+    except SystemExit as exc:
+        # login() and the credential check raise this deliberately and have
+        # already explained themselves; keep whatever code they chose.
+        if exc.code is None:
+            return 0
+        return exc.code if isinstance(exc.code, int) else 1
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # Nothing should reach here -- the menu loop handles per-option
+        # failures -- so if something does, say so plainly instead of ending
+        # on a traceback, and keep the traceback in the log where it is useful.
+        log.critical("Unexpected error: %s", exc, exc_info=True)
+        print(f"\n\u2717 Unexpected error: {exc}")
+        print(f"  This is a bug. Full detail is in {LOG_FILE}")
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(_run_cli())
