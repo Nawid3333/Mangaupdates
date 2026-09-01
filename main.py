@@ -30,6 +30,7 @@ from config.config import (
 
 log = setup_logging()
 
+
 # Terminal colors / styles
 class _T:
     RESET = "\033[0m"
@@ -70,12 +71,12 @@ def _display_width(text: str) -> int:
     for index, char in enumerate(plain):
         # Variation selectors and combining marks attach to the previous
         # character rather than occupying a column of their own.
-        if char in ("\uFE0F", "\uFE0E") or unicodedata.combining(char):
+        if char in ("\ufe0f", "\ufe0e") or unicodedata.combining(char):
             continue
         wide = unicodedata.east_asian_width(char) in ("W", "F")
         # U+FE0F asks for emoji presentation, which is two columns even when
         # the base character is narrow on its own (e.g. the warning sign).
-        emoji_presentation = plain[index + 1 : index + 2] == "\uFE0F"
+        emoji_presentation = plain[index + 1 : index + 2] == "\ufe0f"
         width += 2 if (wide or emoji_presentation) else 1
     return width
 
@@ -325,19 +326,47 @@ def _pages_after_first(total: int) -> list[int]:
 
 
 def _join_pages(pages: list[list], total: int) -> list[dict]:
-    """Concatenate fetched pages, stopping exactly where the serial loop did.
+    """Concatenate fetched pages, stopping once total_hits items are held.
 
-    The old loop extended, then broke once it held total_hits items or hit a
-    page that came back empty. Both rules are replayed here in the same order
-    against the same pages, so a list whose total_hits overstates reality
-    yields the identical items rather than picking up trailing empty pages.
+    The old serial loop also stopped at the first empty page, because there an
+    empty page genuinely meant "there is nothing after this" -- it was what
+    ended the walk. Here every page has already been fetched before this runs,
+    so that rule stopped meaning "no more pages" and started meaning "discard
+    the ones I already have": a single blank page in the middle threw away
+    every page after it. Only the total_hits stop survives.
     """
     items: list[dict] = []
     for results in pages:
         items.extend(results)
-        if len(items) >= total or not results:
+        if len(items) >= total:
             break
     return items
+
+
+def _verify_page_total(items: list[dict], total: int, title: str, pages_fetched: int) -> None:
+    """Refuse to hand back a list shorter than the list said it was.
+
+    A short export is the one failure this module must never pass on
+    silently: it is saved as though it were complete, and the next run diffs
+    against it and reports every item that was missing as removed from the
+    account. _fetch_list_page already aborts rather than substitute a default
+    for exactly that reason; this applies the same rule to the assembled
+    result, which is where a shortfall actually becomes visible.
+
+    The page-limit case stays a warning, not an error -- there the range was
+    knowingly clamped and the shortfall is expected.
+    """
+    if len(items) >= total:
+        return
+    if pages_fetched >= MAX_LIST_PAGES:
+        log.warning("  %s: hit page limit (%d) – list may be incomplete", title, MAX_LIST_PAGES)
+        return
+    raise ValueError(
+        f"MangaUpdates returned an incomplete list for '{title}': "
+        f"{len(items)} of {total} item(s) across {pages_fetched} page(s). "
+        "Nothing was saved — saving this would make the next run report the "
+        "missing series as removed from your account."
+    )
 
 
 @contextlib.contextmanager
@@ -381,9 +410,8 @@ def export_list(client: httpx.Client, list_id: int, title: str) -> list[dict]:
     # The serial loop warned when it had walked every one of the 500 allowed
     # pages and still not reached total_hits. The page range is now computed
     # up front, so the same condition reads as "the range was clamped and the
-    # items it produced still fall short".
-    if len(all_items) < total and len(rest) + 1 >= MAX_LIST_PAGES:
-        log.warning("  %s: hit page limit (%d) – list may be incomplete", title, MAX_LIST_PAGES)
+    # items it produced still fall short". Any *other* shortfall aborts.
+    _verify_page_total(all_items, total, title, len(rest) + 1)
 
     log.info("  %s: %d item(s)", title, len(all_items))
     return all_items
@@ -630,6 +658,7 @@ def export_all_lists(client: httpx.Client, lists: list[dict]) -> dict[str, list[
     jobs = [(index, page) for index, (_results, total) in enumerate(firsts) for page in _pages_after_first(total)]
     later_results: list[list] = []
     if jobs:
+
         def fetch_job(job: tuple[int, int]) -> list:
             index, page = job
             return _fetch_list_page(client, plan[index][1], page)[0]
@@ -647,8 +676,7 @@ def export_all_lists(client: httpx.Client, lists: list[dict]) -> dict[str, list[
     for index, (key, _list_id, title) in enumerate(plan):
         first, total = firsts[index]
         items = _join_pages([first, *later_by_list[index]], total)
-        if len(items) < total and len(later_by_list[index]) + 1 >= MAX_LIST_PAGES:
-            log.warning("  %s: hit page limit (%d) – list may be incomplete", title, MAX_LIST_PAGES)
+        _verify_page_total(items, total, title, len(later_by_list[index]) + 1)
         log.info("  %s: %d item(s)", title, len(items))
         exports[key] = items
     return exports
@@ -786,16 +814,30 @@ def save_related_series(related: dict[int, dict]) -> str:
         # differently every run. Confirmed live before this: two runs of
         # identical code produced two different reports. The id breaks ties
         # so the ordering is total, not merely stable.
-        for _rel_id, entry in sorted(related.items(), key=lambda kv: (kv[1]["title"].lower(), kv[0])):
+        entries = [entry for _rel_id, entry in sorted(related.items(), key=lambda kv: (kv[1]["title"].lower(), kv[0]))]
+        idx_w = len(str(len(entries)))
+        title_w = max((len(e["title"]) for e in entries), default=0)
+        rel_w = max(
+            (
+                len(
+                    ", ".join(
+                        f'{rel_type} of "{origin}"'
+                        for origin, rel_type in sorted(e["sources"], key=lambda src: (src[0].lower(), src[1].lower()))
+                    )
+                )
+                for e in entries
+            ),
+            default=0,
+        )
+        link_w = max((len(e["url"]) for e in entries), default=0)
+        lines.append(f"{'#':<{idx_w}}  {'Title':<{title_w}}  {'Relation':<{rel_w}}  {'Link':<{link_w}}")
+        lines.append(f"{'─' * idx_w}  {'─' * title_w}  {'─' * rel_w}  {'─' * link_w}")
+        for i, entry in enumerate(entries, 1):
             source_bits = ", ".join(
                 f'{rel_type} of "{origin}"'
                 for origin, rel_type in sorted(entry["sources"], key=lambda src: (src[0].lower(), src[1].lower()))
             )
-            lines.append(entry["title"])
-            lines.append(f"  {source_bits}")
-            if entry["url"]:
-                lines.append(f"  {entry['url']}")
-            lines.append("")
+            lines.append(f"{i:<{idx_w}}  {entry['title']:<{title_w}}  {source_bits:<{rel_w}}  {entry['url']}")
 
     body = "\n".join(lines).rstrip("\n") + "\n"
     fd, tmp_path = tempfile.mkstemp(dir=EXPORTS_DIR, suffix=".tmp")
@@ -862,8 +904,7 @@ def find_finished_wishlist_series(client: httpx.Client, wish_items: list[dict]) 
 
     with _worker_pool(SERIES_LOOKUP_WORKERS) as pool:
         future_to_series = {
-            pool.submit(fetch_series_status, client, series_id): (series_id, info)
-            for series_id, info in basic.items()
+            pool.submit(fetch_series_status, client, series_id): (series_id, info) for series_id, info in basic.items()
         }
         for future in concurrent.futures.as_completed(future_to_series):
             series_id, info = future_to_series[future]
@@ -897,14 +938,18 @@ def save_finished_series(finished: dict[int, dict], total_checked: int) -> str:
     else:
         # Same reasoning as save_related_series: collected in as_completed
         # order, so the id breaks title ties into a total ordering.
-        for _sid, entry in sorted(finished.items(), key=lambda kv: (kv[1]["title"].lower(), kv[0])):
-            lines.append(entry["title"])
+        entries = [entry for _sid, entry in sorted(finished.items(), key=lambda kv: (kv[1]["title"].lower(), kv[0]))]
+        idx_w = len(str(len(entries)))
+        title_w = max((len(e["title"]) for e in entries), default=0)
+        status_w = max(
+            (len(" / ".join(s.strip() for s in e["status"].splitlines() if s.strip())) for e in entries), default=0
+        )
+        link_w = max((len(e["url"]) for e in entries), default=0)
+        lines.append(f"{'#':<{idx_w}}  {'Title':<{title_w}}  {'Status':<{status_w}}  {'Link':<{link_w}}")
+        lines.append(f"{'─' * idx_w}  {'─' * title_w}  {'─' * status_w}  {'─' * link_w}")
+        for i, entry in enumerate(entries, 1):
             status_text = " / ".join(s.strip() for s in entry["status"].splitlines() if s.strip())
-            if status_text:
-                lines.append(f"  {status_text}")
-            if entry["url"]:
-                lines.append(f"  {entry['url']}")
-            lines.append("")
+            lines.append(f"{i:<{idx_w}}  {entry['title']:<{title_w}}  {status_text:<{status_w}}  {entry['url']}")
 
     body = "\n".join(lines).rstrip("\n") + "\n"
     fd, tmp_path = tempfile.mkstemp(dir=EXPORTS_DIR, suffix=".tmp")
@@ -1007,18 +1052,22 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
     prev_folder = find_previous_export(current_folder)
     if not prev_folder:
         log.info("")
-        for line in _box([
-            _style("ℹ  No previous export found", _T.BOLD, _T.CYAN),
-            _style("   Skipping comparison", _T.DIM),
-        ]):
+        for line in _box(
+            [
+                _style("ℹ  No previous export found", _T.BOLD, _T.CYAN),
+                _style("   Skipping comparison", _T.DIM),
+            ]
+        ):
             log.info(line)
         return False
 
     prev_name = os.path.basename(prev_folder)
     log.info("")
-    for line in _box([
-        _style("  📋  Changes since last export (" + prev_name + ")", _T.BOLD, _T.BLUE),
-    ]):
+    for line in _box(
+        [
+            _style("  📋  Changes since last export (" + prev_name + ")", _T.BOLD, _T.BLUE),
+        ]
+    ):
         log.info(line)
 
     # Load every previous list once; both the movement scan and the
@@ -1153,9 +1202,7 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
     # written with if list ordering changed between runs.
     prev_manifest = load_manifest(prev_folder, [])
     if not prev_manifest:
-        prev_manifest = {
-            f[:-5]: f[:-5] for f in os.listdir(prev_folder) if f.endswith(".json") and f != MANIFEST_NAME
-        }
+        prev_manifest = {f[:-5]: f[:-5] for f in os.listdir(prev_folder) if f.endswith(".json") and f != MANIFEST_NAME}
     # Read the manifest save_exports already wrote for this run, rather than
     # recomputing it -- one source of truth for what filenames this folder
     # actually uses.
@@ -1171,17 +1218,21 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
 
     if not has_changes:
         log.info("")
-        for line in _box([
-            _style("  ✅ NO CHANGES", _T.BOLD, _T.GREEN),
-            _style("     All lists are identical to the previous export", _T.DIM),
-        ]):
+        for line in _box(
+            [
+                _style("  ✅ NO CHANGES", _T.BOLD, _T.GREEN),
+                _style("     All lists are identical to the previous export", _T.DIM),
+            ]
+        ):
             log.info(line)
     else:
         log.info("")
-        for line in _box([
-            _style("  ⚠️  CHANGES DETECTED", _T.BOLD, _T.YELLOW),
-            _style("     Review the details above", _T.DIM),
-        ]):
+        for line in _box(
+            [
+                _style("  ⚠️  CHANGES DETECTED", _T.BOLD, _T.YELLOW),
+                _style("     Review the details above", _T.DIM),
+            ]
+        ):
             log.info(line)
 
     return has_changes
@@ -1251,13 +1302,15 @@ def run_scan_lists(client: httpx.Client) -> None:
     elapsed = time.time() - start_time
     total_items = sum(len(items) for items in exports.values())
     log.info("")
-    for line in _box([
-        _style(
-            f"  📊 Summary: {len(exports)} list(s), {total_items} item(s), in {elapsed:.1f}s",
-            _T.BOLD,
-            _T.BLUE,
-        ),
-    ]):
+    for line in _box(
+        [
+            _style(
+                f"  📊 Summary: {len(exports)} list(s), {total_items} item(s), in {elapsed:.1f}s",
+                _T.BOLD,
+                _T.BLUE,
+            ),
+        ]
+    ):
         log.info(line)
 
 

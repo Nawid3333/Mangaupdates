@@ -1,0 +1,9 @@
+{
+  "display_width/long_mixed_line": 3.950000973418355e-05,
+  "export_filenames/500_lists": 0.00031370000215247273,
+  "get_series_basic/5000_items": 0.0012698999780695885,
+  "get_series_ids/5000_items": 0.0009057999996002764,
+  "join_pages/5000_items": 1.09999964479357e-05,
+  "save_finished_series/2000_entries": 0.0034985000093001872,
+  "save_related_series/2000_entries": 0.005857500014826655
+}

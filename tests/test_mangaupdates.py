@@ -56,7 +56,7 @@ class TempExportsCase(unittest.TestCase):
 # ==================== sanitize_filename ====================
 class TestSanitizeFilename(unittest.TestCase):
     def test_strips_unsafe_characters(self):
-        name = 'a<b>c:d"e/f' + chr(92) + 'g|h?i*j'
+        name = 'a<b>c:d"e/f' + chr(92) + "g|h?i*j"
         self.assertEqual(mu.sanitize_filename(name), "a_b_c_d_e_f_g_h_i_j")
 
     def test_empty_input_falls_back(self):
@@ -246,7 +246,6 @@ class TestFindPreviousExport(TempExportsCase):
         self.assertEqual(os.path.basename(prev), "02.01.2026_00-00-00")
 
 
-
 # ==================== get_series_ids / get_series_basic robustness ====================
 class TestSeriesExtractionRobustness(unittest.TestCase):
     """`.get("record", {})` only substitutes its default when the key is
@@ -363,7 +362,6 @@ class TestApiRequestRetriesRateLimit(unittest.TestCase):
         self.assertEqual(client.get.call_count, mu.MAX_RETRIES)
 
 
-
 # ==================== reproducible output ====================
 class TestReportsAreReproducible(TempExportsCase):
     """Everything reaching a report is collected in as_completed order --
@@ -402,11 +400,14 @@ class TestReportsAreReproducible(TempExportsCase):
 
         def report(ids):
             related = {
-                sid: {"title": "Same Title", "url": f"http://x/{sid}", "sources": [("O", "Sequel")]}
-                for sid in ids
+                sid: {"title": "Same Title", "url": f"http://x/{sid}", "sources": [("O", "Sequel")]} for sid in ids
             }
             mu.save_related_series(related)
-            return [ln for ln in self._report_body("related.txt") if ln.startswith("http")]
+            return [
+                ln.rsplit("  ", 1)[-1]
+                for ln in self._report_body("related.txt")
+                if ln.startswith("1  Same Title") or ln.startswith("2  Same Title") or ln.startswith("3  Same Title")
+            ]
 
         forwards = report([3, 1, 2])
         backwards = report([2, 3, 1])
@@ -415,12 +416,13 @@ class TestReportsAreReproducible(TempExportsCase):
 
     def test_finished_entries_that_tie_on_title_keep_a_total_order(self):
         def report(ids):
-            finished = {
-                sid: {"title": "Same Title", "url": f"http://x/{sid}", "status": "Complete"}
-                for sid in ids
-            }
+            finished = {sid: {"title": "Same Title", "url": f"http://x/{sid}", "status": "Complete"} for sid in ids}
             mu.save_finished_series(finished, len(ids))
-            return [ln for ln in self._report_body("ready_to_read.txt") if ln.startswith("http")]
+            return [
+                ln.rsplit("  ", 1)[-1]
+                for ln in self._report_body("ready_to_read.txt")
+                if ln.startswith("1  Same Title") or ln.startswith("2  Same Title") or ln.startswith("3  Same Title")
+            ]
 
         forwards = report([3, 1, 2])
         backwards = report([2, 3, 1])
@@ -1365,7 +1367,7 @@ class _PagingApi:
             results = items[: per_page * 3]
         else:
             begin = (page - 1) * per_page
-            results = items[begin:begin + per_page]
+            results = items[begin : begin + per_page]
         return _FakeApiResponse(200, {"results": results, "total_hits": reported_total})
 
 
@@ -1413,11 +1415,30 @@ class TestExportListPaging(unittest.TestCase):
         mu.export_list(api, 1, "L")
         self.assertEqual(sorted(api.calls), [(1, 1), (1, 2), (1, 3), (1, 4)])
 
-    def test_stops_at_the_first_empty_page(self):
-        """A hole in the paging must end the list where the serial walk did."""
+    def test_a_hole_in_the_paging_aborts_instead_of_truncating(self):
+        """A blank page mid-list must abort, not quietly shorten the export.
+
+        The serial walk ended at the first empty page because that was how it
+        discovered the end. Every page is fetched up front now, so an empty
+        one in the middle says nothing about where the list ends -- it only
+        means one response came back blank. Ending there both discarded pages
+        already in hand and, far worse, saved the remainder as if it were the
+        whole list, which the next run reads as "these series were removed".
+        """
         api = _PagingApi({1: (_items(1, 365), 365)}, mode="hole")
-        got = mu.export_list(api, 1, "L")
-        self.assertEqual(len(got), mu.ITEMS_PER_PAGE, "must not resume past an empty page")
+        with self.assertRaises(ValueError) as caught:
+            mu.export_list(api, 1, "L")
+        self.assertIn("incomplete", str(caught.exception).lower())
+        self.assertIn("265 of 365", str(caught.exception))
+
+    def test_pages_after_a_blank_one_are_not_discarded(self):
+        """The pages fetched after the hole must still be counted.
+
+        The old rule dropped them on the floor; the shortfall reported in the
+        abort message is the proof they were kept -- 265, not 100.
+        """
+        pages = [_items(1, 100), [], _items(101, 100), _items(201, 65)]
+        self.assertEqual(len(mu._join_pages(pages, 365)), 265)
 
     def test_stops_once_total_hits_is_reached(self):
         """A page returning more rows than asked for must still stop on total_hits.
@@ -1538,7 +1559,8 @@ class TestExportAllListsPaging(unittest.TestCase):
             out = mu.export_all_lists(api, [{"list_id": 1, "title": "Big"}])
         self.assertEqual(out["Big"], spec[1][0])
         self.assertGreater(
-            _peak_overlap(api.intervals), 1,
+            _peak_overlap(api.intervals),
+            1,
             "pages 2-10 of a single list were fetched one at a time",
         )
 
@@ -1776,7 +1798,6 @@ class TestCollectRelatedSeries(unittest.TestCase):
             peak = max(peak, running)
         self.assertGreaterEqual(peak, 2, "expected at least two calls in flight at once")
         self.assertLessEqual(peak, 4, "must never exceed the configured worker count")
-
 
 
 class TestSaveRelatedSeries(TempExportsCase):

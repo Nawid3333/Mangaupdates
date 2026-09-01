@@ -49,10 +49,12 @@ desktop.ini
 # Credentials / env files
 .env
 
+# Logs
+logs/
+*.log
+
 # Project local data (generated at runtime)
 /exports/
-/logs/
-*.log
 
 
 # Coverage output
