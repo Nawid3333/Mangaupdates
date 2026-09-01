@@ -715,7 +715,11 @@ class _AuthClient:
 
 class TestLogin(unittest.TestCase):
     def test_returns_the_session_token(self):
-        self.assertEqual(mu.login(_AuthClient()), "tok")
+        """Credentials are patched in: without this the test reads whatever is
+        in the developer's own .env, and fails anywhere that file is absent --
+        every CI run, and every fresh clone."""
+        with patch.object(mu, "USERNAME", "user"), patch.object(mu, "PASSWORD", "pass"):
+            self.assertEqual(mu.login(_AuthClient()), "tok")
 
     def test_missing_credentials_exit_before_any_request(self):
         client = _AuthClient()
