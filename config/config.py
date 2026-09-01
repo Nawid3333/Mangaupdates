@@ -4,15 +4,26 @@ from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
 
-# Load environment variables from project root .env
-load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+# ==================== PROJECT HOME ====================
+# Every path this program reads or writes -- .env, exports/, logs/ -- hangs off
+# one directory, so there is a single thing to point somewhere else.
+#
+# Unset, it resolves to the repo checkout exactly as it always has, so running
+# from a clone is byte-for-byte unchanged. MU_HOME overrides it, which is what
+# makes an installed copy usable: in a venv this file sits inside
+# site-packages, where no user can reasonably find a .env to edit.
+_DEFAULT_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+BASE_DIR = os.path.abspath(os.environ.get("MU_HOME") or _DEFAULT_HOME)
+
+# Load environment variables from the project home .env
+ENV_FILE = os.path.join(BASE_DIR, ".env")
+load_dotenv(ENV_FILE)
 
 # Credentials
 USERNAME = os.getenv("MU_USERNAME", "")
 PASSWORD = os.getenv("MU_PASSWORD", "")
 
 # Paths
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 EXPORTS_DIR = os.path.join(BASE_DIR, "exports")
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
 

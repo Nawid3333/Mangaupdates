@@ -1,6 +1,6 @@
 # MangaUpdates List Exporter
 
-[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
 A menu-driven Python tool for your [MangaUpdates](https://www.mangaupdates.com/) account: export all your lists (Reading, Wish, Complete, Unfinished, On Hold, and custom lists) to JSON via the official API and see what changed since last time, find related series you don't already track, or find out which of your Wish List series have finished releasing so you know what's safe to start reading.
@@ -97,9 +97,13 @@ Done!
    cd Mangaupdates
    ```
 
-2. **Install dependencies**
+2. **Create a virtual environment and install dependencies**
 
    ```bash
+   python -m venv .venv
+   source .venv/bin/activate        # Linux / macOS
+   .venv\Scripts\Activate.ps1       # Windows (PowerShell)
+
    pip install -r requirements.txt
    ```
 
@@ -115,6 +119,45 @@ Done!
    MU_USERNAME=your_username
    MU_PASSWORD=your_password
    ```
+
+### Install it as a command
+
+Building a wheel puts a `mangaupdates-scraper` command on your PATH:
+
+```bash
+pip install build
+python -m build
+pip install dist/mangaupdates_scraper-1.0.0-py3-none-any.whl
+```
+
+Two things are worth knowing before you do.
+
+**Give each program its own virtual environment.** This project and its siblings
+ship their code as the top-level modules `main` and `config`. Install two of them
+into the same environment and the second overwrites the first — the command still
+exists, but it silently runs the other program. `pipx` creates an isolated
+environment per application and avoids this entirely:
+
+```bash
+pipx install .
+```
+
+**Tell it where to keep your files.** Once installed, the package lives inside
+`site-packages`, which is no place to keep a `.env` you have to edit by hand.
+Point `MU_HOME` at a folder you own, and `.env` and the `exports/` and `logs/` folders all move there:
+
+```bash
+export MU_HOME=~/mangaupdates                # Linux / macOS
+$env:MU_HOME = "$HOME\mangaupdates"          # Windows (PowerShell)
+
+mkdir -p ~/mangaupdates
+cp .env.example ~/mangaupdates/.env
+```
+
+`MU_HOME` has to be a real environment variable. It cannot be set inside `.env`,
+because it is what tells the program where to find that file in the first place.
+Left unset it resolves to the checkout, which is why running from a clone needs
+no configuration at all.
 
 ## Usage
 
@@ -158,6 +201,13 @@ Settings can be adjusted in `config/config.py`:
 | `SERIES_LOOKUP_WORKERS`  | `16`    | Concurrent threads for the per-series lookups options 2 and 3 make. Benchmarked live against the real API; 16 is where the throughput curve flattens. Raise for a faster run, lower to be gentler on a very large account |
 | `LIST_PAGE_WORKERS`      | `8`     | Concurrent threads for list page requests (all three options). Page 1 reports `total_hits`, so the whole page range is fetched in one go rather than walked |
 
+One setting lives in the environment rather than in `config/config.py`:
+`MU_HOME` decides where `.env`, `exports/` and `logs/` live. Unset, that is this
+checkout. Set it when you install the package, so those do not land in
+site-packages. It must be a real environment variable — it cannot go in `.env`,
+because it is what locates that file.
+
+
 ## Tests
 
 ```bash
@@ -176,7 +226,10 @@ Runs offline — no credentials or network access needed. Covers filename collis
 
 ## Requirements
 
-- Python 3.10+ — developed and tested on 3.14. The 3.10 floor comes from a PEP 604 `X | None` annotation evaluated at runtime; earlier 3.x versions are not tested.
+- **Python 3.11+** — developed and tested on 3.14. `requires-python` in
+  `pyproject.toml` enforces 3.11, so pip will refuse anything older. The code
+  itself uses nothing newer than a PEP 604 `X | None` annotation evaluated at
+  runtime, so 3.10 would very likely work — it is simply not tested.
 - A [MangaUpdates](https://www.mangaupdates.com/) account
 
 ## Author
