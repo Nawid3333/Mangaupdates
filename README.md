@@ -182,7 +182,6 @@ Option 1's exports are saved to `exports/<timestamp>/` with one JSON file per li
 ├── README.md            # This file
 ├── main.py              # Menu, login, export/compare/rotate, related-series, finished-series check
 ├── requirements.txt     # Python dependencies
-├── ruff.toml            # Lint/format configuration
 ├── config/
 │   └── config.py            # Paths, API settings, retry/export tuning, logging
 └── tests/
