@@ -154,6 +154,10 @@ mkdir -p ~/mangaupdates
 cp .env.example ~/mangaupdates/.env
 ```
 
+If you skip that copy, the first run writes the template there for you and
+says where it put it -- so an installed copy never leaves you hunting for a
+file inside `site-packages`.
+
 `MU_HOME` has to be a real environment variable. It cannot be set inside `.env`,
 because it is what tells the program where to find that file in the first place.
 Left unset it resolves to the checkout, which is why running from a clone needs

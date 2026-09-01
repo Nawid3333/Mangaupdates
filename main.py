@@ -25,6 +25,7 @@ from config.config import (
     RETRY_DELAY,
     SERIES_LOOKUP_WORKERS,
     USERNAME,
+    ensure_env_file,
     setup_logging,
 )
 
@@ -1435,6 +1436,16 @@ def _run_cli() -> int:
     Inside `if __name__ == "__main__"` it was the one piece of the program
     that no test could execute.
     """
+    # A fresh install has no .env anywhere, so write the template out rather than
+    # leaving the user a filename to hunt for. Deliberately non-fatal: the
+    # credential check further in reports what still needs filling in.
+    created = ensure_env_file()
+    if created:
+        print("")
+        print("Created a credentials file at:")
+        print(f"    {created}")
+        print("Fill in your details there, then run this again.")
+        print("")
     try:
         main()
     except KeyboardInterrupt:
