@@ -127,7 +127,7 @@ Building a wheel puts a `mangaupdates-scraper` command on your PATH:
 ```bash
 pip install build
 python -m build
-pip install dist/mangaupdates_scraper-2.0.2-py3-none-any.whl
+pip install dist/mangaupdates_scraper-*-py3-none-any.whl
 ```
 
 Two things are worth knowing before you do.
