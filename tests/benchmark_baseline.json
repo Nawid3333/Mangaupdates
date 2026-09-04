@@ -4,6 +4,6 @@
   "get_series_basic/5000_items": 0.0012698999780695885,
   "get_series_ids/5000_items": 0.0009057999996002764,
   "join_pages/5000_items": 1.09999964479357e-05,
-  "save_finished_series/2000_entries": 0.0034985000093001872,
-  "save_related_series/2000_entries": 0.005857500014826655
+  "save_finished_series/2000_entries": 0.0077264000079361,
+  "save_related_series/2000_entries": 0.0083030999908224
 }

@@ -56,7 +56,11 @@ def _strip_ansi(text: str) -> str:
 
     The pattern is compiled once at import. It used to be re-imported and
     re-compiled on every call, and this runs for every line of every box.
+    Almost no line carries an escape at all, so the scan for one is done
+    with a substring test before paying for the regex.
     """
+    if "" not in text:
+        return text
     return _ANSI_RE.sub("", text)
 
 
@@ -66,7 +70,15 @@ def _display_width(text: str) -> int:
     len() counts code points, and an emoji is one code point but two columns
     in every terminal that renders it, so a line containing one came out a
     column short and pushed the box's right edge out of line with the rest.
+
+    Report text is overwhelmingly plain ASCII, and no ASCII character is
+    wide, combining or a variation selector, so its width is just its
+    length. That fast path matters: the wrapper measures a growing prefix
+    once per word and once per character of a hard-broken URL, so the
+    per-character loop below otherwise dominates writing a large report.
     """
+    if text.isascii() and "" not in text:
+        return len(text)
     plain = _strip_ansi(text)
     width = 0
     for index, char in enumerate(plain):
@@ -795,19 +807,24 @@ def save_related_series(related: dict[int, dict]) -> str:
     the same reason save_exports uses the same pattern: a crash mid-write
     must never leave a half-written related.txt in place of a good one.
 
-    Always writes, even when nothing was found, so the file's absence never
-    has to be read as "did this step run at all".
+    The output uses the same box/card layout as save_finished_series so
+    the two reports are visually consistent.
     """
     path = os.path.join(EXPORTS_DIR, "related.txt")
-    lines = [
-        f"Related series not already in your lists — {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}",
-        f"{len(related)} found",
-        "=" * 68,
+    now = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    inner_width = FINISHED_REPORT_WIDTH - 4  # "║  ...  ║"
+
+    lines: list[str] = [
+        _CARD_TOP,
+        "║" + _pad_finished_line(f"  Related Series — {now}") + "║",
+        _CARD_MID,
+        "║" + _pad_finished_line(f"  {len(related)} related series found") + "║",
+        _CARD_BOTTOM,
         "",
     ]
 
     if not related:
-        lines.append("(none — every related series turned up is already in one of your lists)")
+        lines.append("  (none — every related series found is already in one of your lists)")
     else:
         # Everything here was collected in as_completed order -- whichever
         # lookup happened to finish first -- so both the entries and their
@@ -816,29 +833,33 @@ def save_related_series(related: dict[int, dict]) -> str:
         # identical code produced two different reports. The id breaks ties
         # so the ordering is total, not merely stable.
         entries = [entry for _rel_id, entry in sorted(related.items(), key=lambda kv: (kv[1]["title"].lower(), kv[0]))]
-        idx_w = len(str(len(entries)))
-        title_w = max((len(e["title"]) for e in entries), default=0)
-        rel_w = max(
-            (
-                len(
-                    ", ".join(
-                        f'{rel_type} of "{origin}"'
-                        for origin, rel_type in sorted(e["sources"], key=lambda src: (src[0].lower(), src[1].lower()))
-                    )
-                )
-                for e in entries
-            ),
-            default=0,
-        )
-        link_w = max((len(e["url"]) for e in entries), default=0)
-        lines.append(f"{'#':<{idx_w}}  {'Title':<{title_w}}  {'Relation':<{rel_w}}  {'Link':<{link_w}}")
-        lines.append(f"{'─' * idx_w}  {'─' * title_w}  {'─' * rel_w}  {'─' * link_w}")
+        total = len(entries)
+        idx_width = len(str(total))
+
         for i, entry in enumerate(entries, 1):
             source_bits = ", ".join(
                 f'{rel_type} of "{origin}"'
                 for origin, rel_type in sorted(entry["sources"], key=lambda src: (src[0].lower(), src[1].lower()))
             )
-            lines.append(f"{i:<{idx_w}}  {entry['title']:<{title_w}}  {source_bits:<{rel_w}}  {entry['url']}")
+
+            lines.append(_CARD_TOP)
+            # Wrapped like every other line in the card: _pad_finished_line
+            # only pads, so an over-long title used to push this one row past
+            # the border while the rest of the card stayed at the fixed width.
+            header = f"  [{i:>{idx_width}}/{total}]  {entry['title']}"
+            for line in _wrap_finished_line(header, inner_width):
+                lines.append("║" + _pad_finished_line(line) + "║")
+            lines.append(_CARD_MID)
+
+            for line in _wrap_finished_line(f"  Relation: {source_bits}", inner_width):
+                lines.append("║" + _pad_finished_line(line) + "║")
+
+            for line in _wrap_finished_line(f"  Link: {entry['url']}", inner_width):
+                lines.append("║" + _pad_finished_line(line) + "║")
+
+            lines.append(_CARD_BOTTOM)
+            if i < total:
+                lines.append("")
 
     body = "\n".join(lines).rstrip("\n") + "\n"
     fd, tmp_path = tempfile.mkstemp(dir=EXPORTS_DIR, suffix=".tmp")
@@ -919,38 +940,171 @@ def find_finished_wishlist_series(client: httpx.Client, wish_items: list[dict]) 
     return finished
 
 
+# Width chosen so each card fits comfortably in an 80-column terminal.
+FINISHED_REPORT_WIDTH = 82
+
+# Every card draws the same three borders, and a large report draws thousands
+# of them, so they are built once rather than re-joined per card.
+_CARD_TOP = "╔" + "═" * FINISHED_REPORT_WIDTH + "╗"
+_CARD_MID = "╠" + "═" * FINISHED_REPORT_WIDTH + "╣"
+_CARD_BOTTOM = "╚" + "═" * FINISHED_REPORT_WIDTH + "╝"
+
+
+# A completion marker as MangaUpdates writes it: "(Complete)", "(Cancelled)".
+# The trailing boundary is \b, not (?!\)) -- the negative lookahead this used
+# to carry required the marker *not* to be closed, so the three ordinary forms
+# "(Complete)", "(Cancelled)" and "(Discontinued)" never matched and only the
+# malformed "(Complete" did. Nothing looked wrong because _split_finished_status
+# falls back to "first fragment plus the rest", which is the same answer
+# whenever the marker is in the first fragment; the branch that keeps a whole
+# out-of-order status intact simply never ran. The (?<!\() guard is kept: it is
+# what stops a doubled "((Complete" from reading as a marker.
+_FINISHED_STATUS_SPLIT_RE = re.compile(
+    r"(?<!\()\((Complete|Completed|Cancelled|Discontinued)\b",
+    re.IGNORECASE,
+)
+
+
+def _pad_finished_line(text: str) -> str:
+    """Pad `text` to the report width using display columns, not codepoints."""
+    return text + " " * max(0, FINISHED_REPORT_WIDTH - _display_width(text))
+
+
+def _wrap_finished_line(text: str, inner_width: int) -> list[str]:
+    """Wrap `text` to `inner_width` display columns, preserving leading whitespace.
+
+    The first line's leading spaces are measured and then reapplied to every
+    continuation line so multi-line status and detail blocks stay aligned.
+    Long unbroken tokens (typically URLs) are hard-broken so they do not
+    force a single word onto its own line.
+    """
+    if _display_width(text) <= inner_width:
+        return [text]
+
+    leading_match = re.match(r"^(\s+)", text)
+    leading = leading_match.group(1) if leading_match else ""
+    continuation = " " * _display_width(leading)
+    content = text[len(leading) :]
+    words = content.split(" ")
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}" if current else word
+        if _display_width(leading + candidate) <= inner_width:
+            current = candidate
+            continue
+
+        if current:
+            lines.append(leading + current)
+            leading = continuation
+            current = ""
+
+        # A single word that is wider than the line must be hard-broken.
+        while _display_width(leading + word) > inner_width:
+            # Take as much of the word as will fit.
+            take = ""
+            for char in word:
+                test = take + char
+                if _display_width(leading + test) > inner_width:
+                    break
+                take = test
+            if not take:
+                # The leading indent alone fills the line; force at least one char.
+                take = word[0]
+            lines.append(leading + take)
+            leading = continuation
+            word = word[len(take) :]
+        current = word
+
+    if current:
+        lines.append(leading + current)
+    return lines
+
+
+def _split_finished_status(status_text: str) -> tuple[str, list[str]]:
+    """Split a MangaUpdates status into a headline and detail bullets.
+
+    Slash-separated fragments such as:
+        "12 Volumes (Complete) / S1: 6 Volumes / S2: 6 Volumes"
+    are separated so the overall completion phrase stays on the Status line
+    and the per-season / per-format notes become indented bullets. When no
+    fragment carries a completion marker, the whole string becomes the
+    headline so nothing is silently dropped.
+    """
+    parts = [p.strip() for p in status_text.split("/") if p.strip()]
+    if not parts:
+        return "", []
+    if len(parts) == 1:
+        return parts[0], []
+
+    first = parts[0]
+    if _FINISHED_STATUS_SPLIT_RE.search(first):
+        return first, parts[1:]
+
+    # No clear completion marker in the first fragment. If any later fragment
+    # carries one, keep the whole original status as the headline rather than
+    # elevating an arbitrary later fragment. Otherwise fall back to the first
+    # fragment plus the rest as details.
+    if any(_FINISHED_STATUS_SPLIT_RE.search(p) for p in parts[1:]):
+        return status_text, []
+    return first, parts[1:]
+
+
 def save_finished_series(finished: dict[int, dict], total_checked: int) -> str:
     """Write the finished-Wish-List report to a single, stable path.
 
     Same stable-path, atomic-overwrite pattern as save_related_series: one
     fixed file (exports/ready_to_read.txt) that always holds the newest run,
-    not one per timestamped export folder.
+    not one per timestamped export folder. The output uses a box layout with
+    one card per series so long status strings are readable.
     """
     path = os.path.join(EXPORTS_DIR, "ready_to_read.txt")
-    lines = [
-        f"Wish List series that have finished releasing — {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}",
-        f"{len(finished)} of {total_checked} found",
-        "=" * 68,
+    now = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    inner_width = FINISHED_REPORT_WIDTH - 4  # "║  ...  ║"
+
+    lines: list[str] = [
+        _CARD_TOP,
+        "║" + _pad_finished_line(f"  Finished Wish List Series — {now}") + "║",
+        _CARD_MID,
+        "║" + _pad_finished_line(f"  {len(finished)} series finished out of {total_checked} checked") + "║",
+        _CARD_BOTTOM,
         "",
     ]
 
     if not finished:
-        lines.append("(none — nothing on your Wish List has finished releasing yet)")
+        lines.append("  No Wish List series have finished releasing yet.")
     else:
-        # Same reasoning as save_related_series: collected in as_completed
-        # order, so the id breaks title ties into a total ordering.
+        # Sort by title; use the series id to break ties into a total order.
         entries = [entry for _sid, entry in sorted(finished.items(), key=lambda kv: (kv[1]["title"].lower(), kv[0]))]
-        idx_w = len(str(len(entries)))
-        title_w = max((len(e["title"]) for e in entries), default=0)
-        status_w = max(
-            (len(" / ".join(s.strip() for s in e["status"].splitlines() if s.strip())) for e in entries), default=0
-        )
-        link_w = max((len(e["url"]) for e in entries), default=0)
-        lines.append(f"{'#':<{idx_w}}  {'Title':<{title_w}}  {'Status':<{status_w}}  {'Link':<{link_w}}")
-        lines.append(f"{'─' * idx_w}  {'─' * title_w}  {'─' * status_w}  {'─' * link_w}")
+        total = len(entries)
+        idx_width = len(str(total))
+
         for i, entry in enumerate(entries, 1):
             status_text = " / ".join(s.strip() for s in entry["status"].splitlines() if s.strip())
-            lines.append(f"{i:<{idx_w}}  {entry['title']:<{title_w}}  {status_text:<{status_w}}  {entry['url']}")
+            summary, details = _split_finished_status(status_text)
+
+            lines.append(_CARD_TOP)
+            # Wrapped like every other line in the card: _pad_finished_line
+            # only pads, so an over-long title used to push this one row past
+            # the border while the rest of the card stayed at the fixed width.
+            header = f"  [{i:>{idx_width}}/{total}]  {entry['title']}"
+            for line in _wrap_finished_line(header, inner_width):
+                lines.append("║" + _pad_finished_line(line) + "║")
+            lines.append(_CARD_MID)
+
+            for line in _wrap_finished_line(f"  Status: {summary}", inner_width):
+                lines.append("║" + _pad_finished_line(line) + "║")
+
+            for detail in details:
+                for line in _wrap_finished_line(f"  ▸ {detail}", inner_width):
+                    lines.append("║" + _pad_finished_line(line) + "║")
+
+            for line in _wrap_finished_line(f"  Link: {entry['url']}", inner_width):
+                lines.append("║" + _pad_finished_line(line) + "║")
+
+            lines.append(_CARD_BOTTOM)
+            if i < total:
+                lines.append("")
 
     body = "\n".join(lines).rstrip("\n") + "\n"
     fd, tmp_path = tempfile.mkstemp(dir=EXPORTS_DIR, suffix=".tmp")

@@ -7,7 +7,7 @@ What belongs here
 -----------------
 Work that grows with the number of series in the account and would regress
 invisibly: assembling pages into a list, reducing a list export to id maps,
-and the report writers that sort and column-align every row.
+and the report writers that sort every row and wrap it into a card.
 
 What does not: anything that makes a request, and anything dominated by
 sleeps -- the retry backoff is deliberately slow and timing it measures the
@@ -73,7 +73,16 @@ def test_export_filename_mapping(bench):
 
 @pytest.mark.benchmark
 def test_writing_the_related_series_report(bench, tmp_path, monkeypatch):
-    """Sorts every entry and every source, then column-aligns the whole table."""
+    """Sorts every entry and every source, then wraps a bordered card for each.
+
+    The card layout emits about seven lines per entry where the old aligned
+    table emitted one, so this timing is not comparable to the one recorded
+    before that change: roughly 7x the output at a third the cost per line.
+    What it still guards is the shape of the cost -- the wrapper measures a
+    growing prefix once per word and once per character of a hard-broken URL,
+    so losing the ASCII fast path in _display_width shows up here as an order
+    of magnitude rather than as drift.
+    """
     monkeypatch.setattr(mu, "EXPORTS_DIR", str(tmp_path))
     related = {
         n: {

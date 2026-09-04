@@ -9,6 +9,7 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -243,6 +244,8 @@ class TestFindPreviousExport(TempExportsCase):
             os.makedirs(os.path.join(self.dir.name, name))
         current = os.path.join(self.dir.name, "03.01.2026_00-00-00")
         prev = mu.find_previous_export(current)
+        self.assertIsNotNone(prev, "the previous export folder was not found")
+        assert prev is not None  # narrows for the type checker
         self.assertEqual(os.path.basename(prev), "02.01.2026_00-00-00")
 
 
@@ -378,8 +381,9 @@ class TestReportsAreReproducible(TempExportsCase):
 
     def _report_body(self, name):
         text = Path(os.path.join(self.dir.name, name)).read_text(encoding="utf-8")
-        # Drop the timestamp header; it is expected to differ.
-        return [ln.strip() for ln in text.splitlines()[3:] if ln.strip()]
+        # Drop the box header; it is expected to differ between runs. The header
+        # now spans 5 lines plus one blank line before the entries.
+        return [ln.rstrip() for ln in text.splitlines()[6:] if ln.strip() or ln.startswith("│") or ln.startswith("║")]
 
     def test_source_order_does_not_depend_on_which_lookup_finished_first(self):
         forwards = [("Alpha", "Sequel"), ("Beta", "Spin-Off"), ("Gamma", "Adaptation")]
@@ -406,7 +410,7 @@ class TestReportsAreReproducible(TempExportsCase):
             return [
                 ln.rsplit("  ", 1)[-1]
                 for ln in self._report_body("related.txt")
-                if ln.startswith("1  Same Title") or ln.startswith("2  Same Title") or ln.startswith("3  Same Title")
+                if re.search(r"\[\d/3\]\s+Same Title", ln)
             ]
 
         forwards = report([3, 1, 2])
@@ -421,7 +425,7 @@ class TestReportsAreReproducible(TempExportsCase):
             return [
                 ln.rsplit("  ", 1)[-1]
                 for ln in self._report_body("ready_to_read.txt")
-                if ln.startswith("1  Same Title") or ln.startswith("2  Same Title") or ln.startswith("3  Same Title")
+                if re.search(r"\[\d/3\]\s+Same Title", ln)
             ]
 
         forwards = report([3, 1, 2])
@@ -1996,7 +2000,8 @@ class TestSaveFinishedSeries(TempExportsCase):
         path = mu.save_finished_series({}, total_checked=5)
         with open(path, encoding="utf-8") as f:
             content = f.read()
-        self.assertIn("none", content.lower())
+        self.assertIn("0 series finished out of 5 checked", content)
+        self.assertIn("finished releasing yet", content.lower())
 
     def test_report_includes_title_status_and_url_and_totals(self):
         finished = {
@@ -2012,7 +2017,8 @@ class TestSaveFinishedSeries(TempExportsCase):
         self.assertIn("Rosario to Vampire", content)
         self.assertIn("10 Volumes (Complete)", content)
         self.assertIn("https://www.mangaupdates.com/series/x/rosario-to-vampire", content)
-        self.assertIn("1 of 7", content)
+        self.assertIn("1 series finished out of 7 checked", content)
+        self.assertIn("[1/1]", content)
 
 
 if __name__ == "__main__":
