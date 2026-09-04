@@ -10,6 +10,7 @@ import tempfile
 import time
 import unicodedata
 from datetime import datetime, timedelta
+from typing import Any, Protocol
 
 import httpx
 
@@ -33,6 +34,15 @@ from src.term import cinput as input
 from src.term import cprint as print
 
 log = setup_logging()
+
+
+# Protocol for the small slice of httpx.Client actually exercised in this
+# module.  Using a protocol lets tests inject scripted fakes without widening
+# every helper to `Any` or pretending `MagicMock` is a real client.
+class _ClientLike(Protocol):
+    def get(self, *args: Any, **kwargs: Any) -> httpx.Response: ...
+    def post(self, *args: Any, **kwargs: Any) -> httpx.Response: ...
+    def put(self, *args: Any, **kwargs: Any) -> httpx.Response: ...
 
 
 # Terminal colours live in src/term.py so all six repos share one vocabulary.
@@ -127,7 +137,7 @@ def _retry_delay(resp: httpx.Response | None) -> float:
     return base + random.uniform(0.0, RETRY_JITTER)
 
 
-def _api_request(client: httpx.Client, method: str, url: str, **kwargs) -> httpx.Response:
+def _api_request(client: _ClientLike, method: str, url: str, **kwargs) -> httpx.Response:
     """Make an API request with automatic retry on transient errors.
 
     429 is retried alongside 5xx and transport errors. It was not before:
@@ -169,7 +179,7 @@ def _api_request(client: httpx.Client, method: str, url: str, **kwargs) -> httpx
     raise RuntimeError("Request loop exited without returning or raising")
 
 
-def login(client: httpx.Client) -> str:
+def login(client: _ClientLike) -> str:
     """Authenticate and return a session token."""
     if not USERNAME or not PASSWORD:
         log.error("MU_USERNAME or MU_PASSWORD not set in .env file")
@@ -210,7 +220,7 @@ def login(client: httpx.Client) -> str:
     return token
 
 
-def check_site_reachable(client: httpx.Client) -> bool:
+def check_site_reachable(client: _ClientLike) -> bool:
     """Confirm the MangaUpdates API is reachable before doing anything else.
 
     Uses an unauthenticated endpoint (series search) so this is a pure
@@ -225,7 +235,7 @@ def check_site_reachable(client: httpx.Client) -> bool:
         return False
 
 
-def logout(client: httpx.Client) -> None:
+def logout(client: _ClientLike) -> None:
     """End the API session."""
     try:
         client.post(f"{API_BASE_URL}/account/logout")
@@ -234,7 +244,7 @@ def logout(client: httpx.Client) -> None:
         log.warning("Logout failed: %s", exc)
 
 
-def fetch_lists(client: httpx.Client) -> list[dict]:
+def fetch_lists(client: _ClientLike) -> list[dict]:
     """Get all user lists (built-in + custom).
 
     The shape is validated here, at the boundary, because everything
@@ -275,7 +285,7 @@ def fetch_lists(client: httpx.Client) -> list[dict]:
 MAX_LIST_PAGES = 500  # Safety limit to prevent infinite loops
 
 
-def _fetch_list_page(client: httpx.Client, list_id: int, page: int) -> tuple[list, int]:
+def _fetch_list_page(client: _ClientLike, list_id: int, page: int) -> tuple[list, int]:
     """Fetch one page of one list. Returns (results, total_hits).
 
     The response shape is checked here instead of being left to fail later.
@@ -402,7 +412,7 @@ def _page_pool(job_count: int):
     return _worker_pool(max(1, min(LIST_PAGE_WORKERS, job_count)))
 
 
-def export_list(client: httpx.Client, list_id: int, title: str) -> list[dict]:
+def export_list(client: _ClientLike, list_id: int, title: str) -> list[dict]:
     """Paginate through a single list and return all items."""
     first, total = _fetch_list_page(client, list_id, 1)
 
@@ -611,7 +621,7 @@ def get_series_basic(items: list[dict]) -> dict[int, dict]:
     return result
 
 
-def export_all_lists(client: httpx.Client, lists: list[dict]) -> dict[str, list[dict]]:
+def export_all_lists(client: _ClientLike, lists: list[dict]) -> dict[str, list[dict]]:
     """Export every list, guarding against two distinct lists sharing a title.
 
     Every list's page 1 is fetched at once, then every remaining page of every
@@ -690,7 +700,7 @@ def export_all_lists(client: httpx.Client, lists: list[dict]) -> dict[str, list[
 
 
 # ==================== Related series ====================
-def fetch_series_related(client: httpx.Client, series_id: int) -> list[dict] | None:
+def fetch_series_related(client: _ClientLike, series_id: int) -> list[dict] | None:
     """Fetch the "Related Series" section for one series.
 
     Returns the raw list of relation objects (title/id/url/relation_type),
@@ -726,7 +736,7 @@ def fetch_series_related(client: httpx.Client, series_id: int) -> list[dict] | N
         return None
 
 
-def collect_related_series(client: httpx.Client, exports: dict[str, list[dict]]) -> dict[int, dict]:
+def collect_related_series(client: _ClientLike, exports: dict[str, list[dict]]) -> dict[int, dict]:
     """Look up every series in every list and gather what is related but not already tracked.
 
     One hop only: a related series is found because it relates to a series
@@ -869,7 +879,7 @@ def save_related_series(related: dict[int, dict]) -> str:
 
 
 # ==================== Wish List completion check ====================
-def fetch_series_status(client: httpx.Client, series_id: int) -> dict | None:
+def fetch_series_status(client: _ClientLike, series_id: int) -> dict | None:
     """Fetch one series' completion state.
 
     `completed` is MangaUpdates' own boolean for "nothing more is ever
@@ -903,7 +913,7 @@ def fetch_series_status(client: httpx.Client, series_id: int) -> dict | None:
         return None
 
 
-def find_finished_wishlist_series(client: httpx.Client, wish_items: list[dict]) -> dict[int, dict]:
+def find_finished_wishlist_series(client: _ClientLike, wish_items: list[dict]) -> dict[int, dict]:
     """Check every series in the Wish List and return the ones that are finished.
 
     Concurrent across SERIES_LOOKUP_WORKERS threads, same pattern and same
@@ -1421,7 +1431,7 @@ def show_menu() -> None:
     print("  0. Exit\n")
 
 
-def run_scan_lists(client: httpx.Client) -> None:
+def run_scan_lists(client: _ClientLike) -> None:
     """Option 1: export every list, save it, and diff it against the previous run."""
     start_time = time.time()
 
@@ -1463,7 +1473,7 @@ def run_scan_lists(client: httpx.Client) -> None:
         log.info(line)
 
 
-def run_related_check(client: httpx.Client) -> None:
+def run_related_check(client: _ClientLike) -> None:
     """Option 2: look up every tracked series' related series."""
     lists = fetch_lists(client)
     if not lists:
@@ -1479,7 +1489,7 @@ def run_related_check(client: httpx.Client) -> None:
     log.info("Related series report saved to: %s (%d found)", related_path, len(related))
 
 
-def run_finished_check(client: httpx.Client) -> None:
+def run_finished_check(client: _ClientLike) -> None:
     """Option 3: find Wish List series that have finished releasing."""
     lists = fetch_lists(client)
     wish_lists = [lst for lst in lists if lst["title"] == "Wish List"]

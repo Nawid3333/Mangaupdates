@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
@@ -125,7 +126,10 @@ def setup_logging():
     fh.setFormatter(term.PlainFormatter("%(asctime)s [%(levelname)s] %(message)s"))
 
     # Console handler: warnings yellow, errors red, criticals magenta.
-    ch = logging.StreamHandler()
+    # Route to stdout so log lines and print()/input() share one ordered
+    # stream; stderr would interleave with the menu prompt and echo input
+    # mid-scroll.
+    ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
     ch.setFormatter(term.ColorFormatter("%(message)s"))
 

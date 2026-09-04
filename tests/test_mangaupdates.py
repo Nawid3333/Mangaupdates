@@ -1035,6 +1035,12 @@ class _ShapeApi:
     def __init__(self, body):
         self._body = body
 
+    def get(self, url, **kwargs):  # noqa: ARG002
+        return _FakeApiResponse(200, {})
+
+    def put(self, url, **kwargs):  # noqa: ARG002
+        return _FakeApiResponse(200, {})
+
     def post(self, url, **kwargs):  # noqa: ARG002
         return _FakeApiResponse(200, self._body)
 
@@ -1155,6 +1161,9 @@ class _MenuApi:
 
     def get(self, url, **kwargs):  # noqa: ARG002
         return _FakeApiResponse(200, self._lists)
+
+    def put(self, url, **kwargs):  # noqa: ARG002
+        return _FakeApiResponse(200, {})
 
     def post(self, url, **kwargs):
         list_id = int(url.rstrip("/search").rsplit("/", 1)[-1])
@@ -1356,6 +1365,12 @@ class _PagingApi:
         self.calls = []
         self.intervals = []
         self._lock = threading.Lock()
+
+    def get(self, url, **kwargs):  # noqa: ARG002
+        return _FakeApiResponse(200, {})
+
+    def put(self, url, **kwargs):  # noqa: ARG002
+        return _FakeApiResponse(200, {})
 
     def post(self, url, **kwargs):
         list_id = int(url.rstrip("/search").rsplit("/", 1)[-1])
@@ -1599,12 +1614,11 @@ class TestPageRange(unittest.TestCase):
 
 
 # ==================== related-series discovery ====================
-class _FakeApiResponse:
+class _FakeApiResponse(httpx.Response):
     def __init__(self, status_code, body):
-        self.status_code = status_code
+        super().__init__(status_code, content=b"", request=httpx.Request("GET", "https://example.com/"))
         self._body = body
         self.headers = {}
-        self.request = None
 
     def json(self):
         return self._body
@@ -1630,6 +1644,12 @@ class _FakeSeriesClient:
         if self.by_id.get(sid) == "404":
             return _FakeApiResponse(404, {})
         return _FakeApiResponse(200, {"related_series": self.by_id.get(sid, [])})
+
+    def post(self, url, **kwargs):  # noqa: ARG002
+        return _FakeApiResponse(200, {})
+
+    def put(self, url, **kwargs):  # noqa: ARG002
+        return _FakeApiResponse(200, {})
 
 
 ONE_PIECE_RELATIONS = [
@@ -1741,6 +1761,12 @@ class TestCollectRelatedSeries(unittest.TestCase):
                     return _FakeApiResponse(200, ["unexpected", "array", "body"])
                 return _FakeApiResponse(200, {"related_series": []})
 
+            def post(self, url, **kwargs):  # noqa: ARG002
+                return _FakeApiResponse(200, {})
+
+            def put(self, url, **kwargs):  # noqa: ARG002
+                return _FakeApiResponse(200, {})
+
         exports = {
             "Reading": [
                 _rec(1, "Good Series 1"),
@@ -1778,6 +1804,12 @@ class TestCollectRelatedSeries(unittest.TestCase):
                 with lock:
                     intervals.append((start, end))
                 return _FakeApiResponse(200, {"related_series": []})
+
+            def post(self, url, **kwargs):  # noqa: ARG002
+                return _FakeApiResponse(200, {})
+
+            def put(self, url, **kwargs):  # noqa: ARG002
+                return _FakeApiResponse(200, {})
 
         with patch.object(mu, "SERIES_LOOKUP_WORKERS", 4):
             wall_start = time.perf_counter()
@@ -1880,6 +1912,12 @@ class _FakeStatusClient:
             return _FakeApiResponse(404, {})
         return _FakeApiResponse(200, self.by_id.get(sid, {"completed": False, "status": ""}))
 
+    def post(self, url, **kwargs):  # noqa: ARG002
+        return _FakeApiResponse(200, {})
+
+    def put(self, url, **kwargs):  # noqa: ARG002
+        return _FakeApiResponse(200, {})
+
 
 class TestFindFinishedWishlistSeries(unittest.TestCase):
     """`completed` is verified live against real MangaUpdates series covering
@@ -1934,6 +1972,12 @@ class TestFindFinishedWishlistSeries(unittest.TestCase):
                 if sid == 999:
                     return _FakeApiResponse(200, ["unexpected", "array", "body"])
                 return _FakeApiResponse(200, {"completed": True, "status": "(Complete)"})
+
+            def post(self, url, **kwargs):  # noqa: ARG002
+                return _FakeApiResponse(200, {})
+
+            def put(self, url, **kwargs):  # noqa: ARG002
+                return _FakeApiResponse(200, {})
 
         wish_items = [_rec_url(1, "Good 1"), _rec_url(999, "Bad Shape"), _rec_url(2, "Good 2")]
         client = ShapeShiftingClient()
