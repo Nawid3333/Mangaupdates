@@ -4,6 +4,8 @@ from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
 
+from src import term
+
 # ==================== PROJECT HOME ====================
 # Every path this program reads or writes -- .env, exports/, logs/ -- hangs off
 # one directory, so there is a single thing to point somewhere else.
@@ -116,15 +118,16 @@ def setup_logging():
         return logger
     logger.setLevel(logging.DEBUG)
 
-    # Rotating file handler (5 MB, 3 backups)
+    # Rotating file handler (5 MB, 3 backups). PlainFormatter strips any colour
+    # a call site added for the console, so the file stays greppable.
     fh = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
-    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    fh.setFormatter(term.PlainFormatter("%(asctime)s [%(levelname)s] %(message)s"))
 
-    # Console handler
+    # Console handler: warnings yellow, errors red, criticals magenta.
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
-    ch.setFormatter(logging.Formatter("%(message)s"))
+    ch.setFormatter(term.ColorFormatter("%(message)s"))
 
     logger.addHandler(fh)
     logger.addHandler(ch)

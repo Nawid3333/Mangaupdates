@@ -28,24 +28,18 @@ from config.config import (
     ensure_env_file,
     setup_logging,
 )
+from src import term
+from src.term import cinput as input
+from src.term import cprint as print
 
 log = setup_logging()
 
 
-# Terminal colors / styles
-class _T:
-    RESET = "\033[0m"
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-    GREEN = "\033[32m"
-    YELLOW = "\033[33m"
-    BLUE = "\033[34m"
-    CYAN = "\033[36m"
-
-
-def _style(text: str, *codes: str) -> str:
-    """Wrap text in ANSI style codes."""
-    return "".join(codes) + text + _T.RESET
+# Terminal colours live in src/term.py so all six repos share one vocabulary.
+# These aliases keep the existing call sites unchanged while giving them the
+# NO_COLOR / not-a-tty gate this module never had.
+_T = term._T
+_style = term.style
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -1414,13 +1408,13 @@ def rotate_exports() -> None:
 
 
 def print_header() -> None:
-    log.info("=" * 60)
-    log.info("  MANGAUPDATES LIST EXPORTER & TRACKER")
-    log.info("=" * 60)
+    log.info("%s", term.style("=" * 60, term._T.CYAN))
+    log.info("%s", term.step("  MANGAUPDATES LIST EXPORTER & TRACKER"))
+    log.info("%s", term.style("=" * 60, term._T.CYAN))
 
 
 def show_menu() -> None:
-    print("\nOptions:")
+    print("\n" + term.step("Options:"))
     print("  1. Scan my lists (export + compare with last run)")
     print("  2. Check related series not already in your lists")
     print("  3. Check Wish List for finished/cancelled series (ready to read)")
@@ -1596,7 +1590,7 @@ def _run_cli() -> int:
     created = ensure_env_file()
     if created:
         print("")
-        print("Created a credentials file at:")
+        print(term.danger("Created a credentials file at:"))
         print(f"    {created}")
         print("Fill in your details there, then run this again.")
         print("")
@@ -1619,8 +1613,8 @@ def _run_cli() -> int:
         # failures -- so if something does, say so plainly instead of ending
         # on a traceback, and keep the traceback in the log where it is useful.
         log.critical("Unexpected error: %s", exc, exc_info=True)
-        print(f"\n\u2717 Unexpected error: {exc}")
-        print(f"  This is a bug. Full detail is in {LOG_FILE}")
+        print("\n" + term.danger(f"\u2717 Unexpected error: {exc}"))
+        print(term.err(f"  This is a bug. Full detail is in {LOG_FILE}"))
         return 1
     return 0
 
