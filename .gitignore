@@ -25,7 +25,6 @@ MANIFEST
 .mypy_cache/
 .dmypy.json
 .ruff_cache/
-
 # Virtual environments
 venv/
 env/
@@ -60,3 +59,4 @@ logs/
 # Coverage output
 .coverage
 htmlcov/
+tests/*.sjson
