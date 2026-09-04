@@ -1620,12 +1620,13 @@ class _FakeApiResponse(httpx.Response):
         self._body = body
         self.headers = {}
 
-    def json(self):
+    def json(self, **kwargs):
         return self._body
 
     def raise_for_status(self):
         if self.status_code >= 400:
             raise httpx.HTTPStatusError("error", request=self.request, response=self)
+        return self
 
 
 class _FakeSeriesClient:
