@@ -43,7 +43,7 @@ class TestPadFinishedLine(unittest.TestCase):
         self.assertEqual(mu._display_width(padded), mu.FINISHED_REPORT_WIDTH)
 
     def test_ansi_codes_do_not_eat_into_the_padding(self):
-        padded = mu._pad_finished_line(mu._style("hello", mu._T.BOLD))
+        padded = mu._pad_finished_line(mu.term.bold("hello"))
         self.assertEqual(mu._display_width(padded), mu.FINISHED_REPORT_WIDTH)
 
 
@@ -102,7 +102,7 @@ class TestWrapFinishedLine(unittest.TestCase):
         """A coloured line must wrap at the same point as a plain one."""
         words = " ".join(["word"] * 20)
         plain = mu._wrap_finished_line(words, 40)
-        coloured = mu._wrap_finished_line(mu._style(words, mu._T.GREEN), 40)
+        coloured = mu._wrap_finished_line(mu.term.ok(words), 40)
         self.assertEqual(len(coloured), len(plain))
 
     def test_wide_characters_count_as_two_columns(self):

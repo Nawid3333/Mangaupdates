@@ -984,7 +984,7 @@ class TestDisplayWidth(unittest.TestCase):
         self.assertEqual(mu._display_width("hello"), 5)
 
     def test_ansi_codes_do_not_count(self):
-        self.assertEqual(mu._display_width(mu._style("hello", mu._T.BOLD, mu._T.GREEN)), 5)
+        self.assertEqual(mu._display_width(mu.term.success("hello")), 5)
 
     def test_emoji_count_as_two_columns(self):
         for emoji in ("✅", "📊", "📋"):
@@ -998,10 +998,10 @@ class TestDisplayWidth(unittest.TestCase):
 
     def test_box_edges_line_up_with_mixed_content(self):
         lines = [
-            mu._style("  ✅ NO CHANGES", mu._T.BOLD, mu._T.GREEN),
-            mu._style("     plain ascii", mu._T.DIM),
-            mu._style("  📊 Summary: 5 list(s)", mu._T.BOLD),
-            mu._style("  ⚠️  CHANGES DETECTED", mu._T.BOLD),
+            mu.term.success("  ✅ NO CHANGES"),
+            mu.term.dim("     plain ascii"),
+            mu.term.bold("  📊 Summary: 5 list(s)"),
+            mu.term.bold("  ⚠️  CHANGES DETECTED"),
         ]
         box = mu._box(lines)
         widths = {mu._display_width(line) for line in box}

@@ -45,11 +45,9 @@ class _ClientLike(Protocol):
     def put(self, *args: Any, **kwargs: Any) -> httpx.Response: ...
 
 
-# Terminal colours live in src/term.py so all six repos share one vocabulary.
-# These aliases keep the existing call sites unchanged while giving them the
-# NO_COLOR / not-a-tty gate this module never had.
-_T = term._T
-_style = term.style
+# Terminal colours live in src/term.py so all six repos share one vocabulary,
+# and with it the NO_COLOR / not-a-tty gate this module never had. Call sites
+# name the meaning (term.warn, term.ok, term.title) rather than the colour.
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -1213,8 +1211,8 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
         log.info("")
         for line in _box(
             [
-                _style("ℹ  No previous export found", _T.BOLD, _T.CYAN),
-                _style("   Skipping comparison", _T.DIM),
+                term.step("ℹ  No previous export found"),
+                term.dim("   Skipping comparison"),
             ]
         ):
             log.info(line)
@@ -1224,7 +1222,7 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
     log.info("")
     for line in _box(
         [
-            _style("  📋  Changes since last export (" + prev_name + ")", _T.BOLD, _T.BLUE),
+            term.title("  📋  Changes since last export (" + prev_name + ")"),
         ]
     ):
         log.info(line)
@@ -1266,14 +1264,14 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
     if moved:
         has_changes = True
         log.info("")
-        log.info("  %s", _style("↔ Moved series", _T.BOLD, _T.YELLOW))
+        log.info("  %s", term.alert("↔ Moved series"))
         for _sid, (name, old_list, new_list) in sorted(moved.items(), key=lambda kv: (kv[1][0].lower(), kv[0])):
             log.info(
                 "     %s %s  %s → %s",
-                _style("↪", _T.YELLOW),
+                term.warn("↪"),
                 name,
-                _style(old_list, _T.DIM),
-                _style(new_list, _T.CYAN),
+                term.dim(old_list),
+                term.accent(new_list),
             )
         log.info("")
 
@@ -1285,11 +1283,10 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
             has_changes = True
             log.info(
                 "  %s  %s",
-                _style("✗", _T.YELLOW),
-                _style(
+                term.warn("✗"),
+                term.warn(
                     f"[{title}] previous export could not be read – cannot compare "
-                    f"(currently {len(current_items)} item(s))",
-                    _T.YELLOW,
+                    f"(currently {len(current_items)} item(s))"
                 ),
             )
             continue
@@ -1297,8 +1294,8 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
         if title not in prev_by_list:
             log.info(
                 "  %s  %s",
-                _style("✱", _T.CYAN),
-                _style(f"[{title}] NEW LIST (not in previous export) – {len(current_items)} item(s)", _T.CYAN),
+                term.accent("✱"),
+                term.accent(f"[{title}] NEW LIST (not in previous export) – {len(current_items)} item(s)"),
             )
             has_changes = True
             continue
@@ -1316,22 +1313,22 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
             if count_diff == 0:
                 log.info(
                     "  %s  %s — %s",
-                    _style("✓", _T.GREEN),
-                    _style(f"[{title}] No changes", _T.GREEN),
-                    _style(f"({len(current_items)} items)", _T.DIM),
+                    term.ok("✓"),
+                    term.ok(f"[{title}] No changes"),
+                    term.dim(f"({len(current_items)} items)"),
                 )
             else:
                 has_changes = True
                 sign = "+" if count_diff >= 0 else ""
                 log.info(
                     "  %s  %s %d → %d (%s%d) %s",
-                    _style("~", _T.YELLOW),
-                    _style(f"[{title}]", _T.BOLD),
+                    term.warn("~"),
+                    term.bold(f"[{title}]"),
                     len(prev_items),
                     len(current_items),
-                    _style(sign, _T.YELLOW),
+                    term.warn(sign),
                     count_diff,
-                    _style("(movements only)", _T.DIM),
+                    term.dim("(movements only)"),
                 )
             continue
 
@@ -1339,20 +1336,20 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
         sign = "+" if count_diff >= 0 else ""
         log.info(
             "  %s  %s %d → %d (%s%d)",
-            _style("✎", _T.YELLOW),
-            _style(f"[{title}]", _T.BOLD),
+            term.warn("✎"),
+            term.bold(f"[{title}]"),
             len(prev_items),
             len(current_items),
-            _style(sign, _T.YELLOW),
+            term.warn(sign),
             count_diff,
         )
 
         # Sets of ids iterate in hash order, which reads as arbitrary and
         # makes two printings of the same change set hard to compare.
         for sid in sorted(added_ids, key=lambda s: (current_ids[s].lower(), s)):
-            log.info("     %s Added:   %s", _style("+", _T.GREEN), current_ids[sid])
+            log.info("     %s Added:   %s", term.ok("+"), current_ids[sid])
         for sid in sorted(removed_ids, key=lambda s: (prev_ids[s].lower(), s)):
-            log.info("     %s Removed: %s", _style("-", _T.YELLOW), prev_ids[sid])
+            log.info("     %s Removed: %s", term.warn("-"), prev_ids[sid])
 
     # Check for lists that existed before but are now gone. Read the
     # previous folder's own manifest for this -- comparing against the
@@ -1371,16 +1368,16 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
             has_changes = True
             log.info(
                 "  %s  %s",
-                _style("✗", _T.YELLOW),
-                _style(f"[{prev_title}] LIST REMOVED (no longer exists)", _T.YELLOW),
+                term.warn("✗"),
+                term.warn(f"[{prev_title}] LIST REMOVED (no longer exists)"),
             )
 
     if not has_changes:
         log.info("")
         for line in _box(
             [
-                _style("  ✅ NO CHANGES", _T.BOLD, _T.GREEN),
-                _style("     All lists are identical to the previous export", _T.DIM),
+                term.success("  ✅ NO CHANGES"),
+                term.dim("     All lists are identical to the previous export"),
             ]
         ):
             log.info(line)
@@ -1388,8 +1385,8 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
         log.info("")
         for line in _box(
             [
-                _style("  ⚠️  CHANGES DETECTED", _T.BOLD, _T.YELLOW),
-                _style("     Review the details above", _T.DIM),
+                term.alert("  ⚠️  CHANGES DETECTED"),
+                term.dim("     Review the details above"),
             ]
         ):
             log.info(line)
@@ -1418,9 +1415,9 @@ def rotate_exports() -> None:
 
 
 def print_header() -> None:
-    log.info("%s", term.style("=" * 60, term._T.CYAN))
+    log.info("%s", term.accent("=" * 60))
     log.info("%s", term.step("  MANGAUPDATES LIST EXPORTER & TRACKER"))
-    log.info("%s", term.style("=" * 60, term._T.CYAN))
+    log.info("%s", term.accent("=" * 60))
 
 
 def show_menu() -> None:
@@ -1463,11 +1460,7 @@ def run_scan_lists(client: _ClientLike) -> None:
     log.info("")
     for line in _box(
         [
-            _style(
-                f"  📊 Summary: {len(exports)} list(s), {total_items} item(s), in {elapsed:.1f}s",
-                _T.BOLD,
-                _T.BLUE,
-            ),
+            term.title(f"  📊 Summary: {len(exports)} list(s), {total_items} item(s), in {elapsed:.1f}s"),
         ]
     ):
         log.info(line)
