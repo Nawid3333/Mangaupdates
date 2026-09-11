@@ -1733,9 +1733,9 @@ class TestAnimePlanetProfileParsing(unittest.TestCase):
         self.assertEqual(mu._ap_parse_profile_list_counts("<p>no lists here</p>"), [])
 
 
-def _ap_card(entry_id: int, title: str, href: str = "/manga/example", cls="tooltip mangaX") -> str:
+def _ap_card(entry_id: int, title: str, href: str = "/manga/example", cls="tooltip mangaX", data_type="manga") -> str:
     return f"""
-    <li data-type="manga" data-id="{entry_id}" class="card">
+    <li data-type="{data_type}" data-id="{entry_id}" class="card">
       <a class="{cls}" href="{href}">
         <h3 class='cardName'>{title}</h3>
       </a>
@@ -1797,6 +1797,29 @@ class TestAnimePlanetListEntryParsing(unittest.TestCase):
     def test_a_page_without_cards_yields_no_entries(self):
         self.assertEqual(mu._ap_parse_list_entries("<p>nothing here</p>"), [])
         self.assertEqual(mu._ap_parse_list_entries(""), [])
+
+    def test_manga_and_anime_cards_sharing_a_raw_id_do_not_collide(self):
+        """Anime-Planet numbers manga and anime from separate sequences --
+        confirmed live: manga "Berserk" is id 14, anime "Berserk" is id 61.
+        Without disambiguation, an unrelated manga and anime that happen to
+        share a raw id would merge into one entry everywhere ids are used as
+        dict keys (get_series_ids, compare_exports' movement scan), reading
+        as a title that impossibly "moved" from a manga list to an anime
+        one."""
+        manga_entries = self._entries(_ap_card(500, "Some Manga", "/manga/x", data_type="manga"))
+        anime_entries = self._entries(_ap_card(500, "Some Anime", "/anime/y", data_type="anime"))
+
+        manga_id = manga_entries[0]["record"]["series"]["id"]
+        anime_id = anime_entries[0]["record"]["series"]["id"]
+
+        self.assertNotEqual(manga_id, anime_id, "same raw id from the two content types must not collide")
+        self.assertEqual(manga_id, 500, "a manga id must still export as the real site id")
+
+    def test_anime_card_url_and_title_are_unaffected_by_the_id_offset(self):
+        entries = self._entries(_ap_card(7, "Some Anime", "/anime/some-anime", data_type="anime"))
+        series = entries[0]["record"]["series"]
+        self.assertEqual(series["title"], "Some Anime")
+        self.assertEqual(series["url"], "https://www.anime-planet.com/anime/some-anime")
 
 
 class _FakeApApiResponse:
@@ -1920,6 +1943,80 @@ class TestAnimePlanetFetchAllListEntries(unittest.TestCase):
         self.assertEqual(mu._ap_fetch_all_list_entries(client, "u", "manga/reading", 0), [])
         self.assertEqual(mu._ap_fetch_all_list_entries(client, "u", "manga/reading", -5), [])
         self.assertEqual(client.calls, [])
+
+
+class TestAnimePlanetExportAllLists(unittest.TestCase):
+    def test_manga_and_anime_stalled_lists_do_not_overwrite_each_other(self):
+        """manga/stalled and anime/stalled used to share the label "Stalled",
+        so exports[label] = items let whichever list was read second silently
+        overwrite the first with no warning -- a live data-loss bug, not a
+        hypothetical one. AP_LIST_TYPES now gives them distinct labels; this
+        pins that down end to end through _ap_export_all_lists rather than
+        just at the label-mapping layer."""
+        profile_html = """
+        <ul class="statList">
+          <li class="status1">
+            <a href="/users/u/manga/stalled"><span class="slCount">1</span><span class="slLabel">stalled</span></a>
+          </li>
+        </ul>
+        <ul class="statList">
+          <li class="status1">
+            <a href="/users/u/anime/stalled"><span class="slCount">1</span><span class="slLabel">stalled</span></a>
+          </li>
+        </ul>
+        """
+        spec = {
+            "": {1: profile_html},
+            "manga/stalled": {1: f'<ul class="cardDeck cardGrid">{_ap_card(1, "Manga Series")}</ul>'},
+            "anime/stalled": {
+                1: f'<ul class="cardDeck cardGrid">{_ap_card(2, "Anime Series", "/anime/x", data_type="anime")}</ul>'
+            },
+        }
+        client = _ApFakeClient(spec)
+
+        exports = mu._ap_export_all_lists(client, "u")
+
+        self.assertEqual(set(exports.keys()), {"Manga Stalled", "Anime Stalled"})
+        self.assertEqual(mu.get_series_ids(exports["Manga Stalled"]), {1: "Manga Series"})
+        self.assertEqual(mu.get_series_ids(exports["Anime Stalled"]), {2 + mu._AP_ANIME_ID_OFFSET: "Anime Series"})
+
+    def test_a_residual_label_collision_is_kept_apart_not_overwritten(self):
+        """Belt-and-suspenders for the same failure mode: even if two
+        list_types ever again produced the same label (a future site change,
+        or two unrecognised URLs deriving the same text), the dedup guard
+        must keep both rather than silently dropping one -- the same
+        protection export_all_lists already has for MangaUpdates' own
+        duplicate-title case."""
+        profile_html = """
+        <ul class="statList">
+          <li class="status1">
+            <a href="/users/u/manga/one"><span class="slCount">1</span><span class="slLabel">dup</span></a>
+          </li>
+          <li class="status2">
+            <a href="/users/u/manga/two"><span class="slCount">1</span><span class="slLabel">dup</span></a>
+          </li>
+        </ul>
+        """
+        spec = {
+            "": {1: profile_html},
+            "manga/one": {1: f'<ul class="cardDeck cardGrid">{_ap_card(1, "First")}</ul>'},
+            "manga/two": {1: f'<ul class="cardDeck cardGrid">{_ap_card(2, "Second")}</ul>'},
+        }
+        client = _ApFakeClient(spec)
+
+        exports = mu._ap_export_all_lists(client, "u")
+
+        self.assertEqual(len(exports), 2, f"a duplicate label silently overwrote a list: {exports.keys()}")
+        all_ids = {sid for items in exports.values() for sid in mu.get_series_ids(items)}
+        self.assertEqual(all_ids, {1, 2})
+
+    def test_ap_list_types_has_no_duplicate_labels(self):
+        """If this ever fails, a new collision has crept into the label map --
+        the exact failure mode manga/stalled vs anime/stalled hit before they
+        were named apart. New entries should get their own distinct label
+        rather than relying on the dedup guard to paper over it."""
+        labels = list(mu.AP_LIST_TYPES.values())
+        self.assertEqual(len(labels), len(set(labels)), f"duplicate labels in AP_LIST_TYPES: {labels}")
 
 
 class TestAnimePlanetPagesNeeded(unittest.TestCase):

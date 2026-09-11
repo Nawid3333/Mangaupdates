@@ -1546,18 +1546,28 @@ def run_finished_check(client: _ClientLike) -> None:
 # ==================== Anime-Planet ====================
 
 AP_BASE_URL = "https://www.anime-planet.com"
+# Manga and anime each get their own status vocabulary on the site, and for
+# ten of these twelve lists that vocabulary is already distinct ("Read" vs
+# "Watched", "Won't Read" vs "Won't Watch", ...). "Stalled" and "Dropped" are
+# the two exceptions -- the site itself uses the identical word for both
+# content types. _ap_export_all_lists keys its `exports` dict by this label,
+# so leaving them identical here meant a non-empty manga/stalled and a
+# non-empty anime/stalled silently collapsed into one entry, discarding
+# whichever list was read first -- a live data-loss bug, not a hypothetical
+# one. Prefixed here so the two stay distinct the same way every other pair
+# already is.
 AP_LIST_TYPES = {
     "manga/read": "Read",
     "manga/reading": "Reading",
     "manga/wanttoread": "Want to Read",
-    "manga/stalled": "Stalled",
-    "manga/dropped": "Dropped",
+    "manga/stalled": "Manga Stalled",
+    "manga/dropped": "Manga Dropped",
     "manga/wontread": "Won't Read",
     "anime/watched": "Watched",
     "anime/watching": "Watching",
     "anime/wanttowatch": "Want to Watch",
-    "anime/stalled": "Stalled",
-    "anime/dropped": "Dropped",
+    "anime/stalled": "Anime Stalled",
+    "anime/dropped": "Anime Dropped",
     "anime/wontwatch": "Won't Watch",
 }
 
@@ -1652,6 +1662,22 @@ def _ap_parse_profile_list_counts(page_html: str) -> list[tuple[str, str, str, i
     return results
 
 
+# Anime-Planet numbers manga and anime entries from two separate sequences,
+# not one shared id space -- confirmed live: Berserk the manga is id 14,
+# Berserk the anime is id 61, unrelated numbers for the same franchise. Every
+# id merge downstream of this module (compare_exports' cross-list movement
+# scan, get_series_ids/get_series_basic) assumes one global id space, because
+# that is what MangaUpdates -- the only other source feeding the same code --
+# genuinely has. Left alone, a manga id that happens to equal some unrelated
+# anime id would make compare_exports think a title "moved" from a manga list
+# to an anime list, and could mask the real add/remove on each side behind
+# that bogus move. Offsetting the anime id space keeps the "one global id
+# space" assumption true for Anime-Planet too. The exported "id" is no longer
+# the raw site id for anime entries because of this, but "url" is untouched,
+# so the real page is always one click away.
+_AP_ANIME_ID_OFFSET = 1_000_000_000
+
+
 def _ap_parse_list_entries(page_html: str) -> list[dict]:
     """Extract entries from an Anime-Planet list page HTML.
 
@@ -1678,6 +1704,8 @@ def _ap_parse_list_entries(page_html: str) -> list[dict]:
             numeric_id = int(entry_id)
         except ValueError:
             continue
+        if card.get("data-type") == "anime":
+            numeric_id += _AP_ANIME_ID_OFFSET
         # 'pl0' used to be demanded alongside 'tooltip', but the live cards
         # carry only "tooltip manga<N>" -- so every link lookup missed and
         # every exported URL came back empty. Match the class the site
@@ -1754,7 +1782,30 @@ def _ap_export_all_lists(ap_client: _AnimePlanetClient, username: str) -> dict[s
 
     log.info("Exporting lists...")
     exports: dict[str, list[dict]] = {}
+    used_labels: set[str] = set()
     for list_type, _href, label, count in list_infos:
+        # Keying `exports` by label alone would let a second list silently
+        # overwrite the first one's data if two distinct list_types (e.g. a
+        # manga and an anime list) ever produce the same label -- exactly
+        # what "Stalled"/"Dropped" used to do before AP_LIST_TYPES gave the
+        # manga and anime versions distinct names. Guarded the same way
+        # export_all_lists guards MangaUpdates' own duplicate-title case, in
+        # case a future site change (or an unrecognised-URL derived label)
+        # reintroduces a collision another way.
+        key = label
+        counter = 2
+        while key in used_labels:
+            key = f"{label} ({counter})"
+            counter += 1
+        if key != label:
+            log.warning(
+                "Duplicate Anime-Planet list label '%s' (list_type=%s) – storing under '%s' to avoid data loss",
+                label,
+                list_type,
+                key,
+            )
+        used_labels.add(key)
+
         items = _ap_fetch_all_list_entries(ap_client, username, list_type, count)
         log.info("  %s: %d item(s)", label, len(items))
         if len(items) < count:
@@ -1768,7 +1819,7 @@ def _ap_export_all_lists(ap_client: _AnimePlanetClient, username: str) -> dict[s
                 len(items),
                 count,
             )
-        exports[label] = items
+        exports[key] = items
     return exports
 
 
