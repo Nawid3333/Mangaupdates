@@ -31,6 +31,10 @@ ENV_TEMPLATE = """# Mangaupdates Credentials
 # Fill in the values below. This file is never committed.
 MU_USERNAME=
 MU_PASSWORD=
+
+# Anime-Planet Username (Option 4)
+# Public list export uses your profile URL: https://www.anime-planet.com/users/{AP_USERNAME}
+AP_USERNAME=
 """
 
 
@@ -53,6 +57,9 @@ def ensure_env_file():
 # Credentials
 USERNAME = os.getenv("MU_USERNAME", "")
 PASSWORD = os.getenv("MU_PASSWORD", "")
+
+# Anime-Planet
+AP_USERNAME = os.getenv("AP_USERNAME", "")
 
 # Paths
 EXPORTS_DIR = os.path.join(BASE_DIR, "exports")

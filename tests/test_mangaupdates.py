@@ -1613,6 +1613,328 @@ class TestPageRange(unittest.TestCase):
         self.assertEqual(len(pages), mu.MAX_LIST_PAGES - 1)
 
 
+# ==================== Anime-Planet parsing ====================
+# The fixtures below mirror the markup the live site sends (verified against
+# www.anime-planet.com in September 2026): one statList per profile section
+# with slCount/slLabel spans inside the anchor, and cardDeck cards whose
+# tooltip anchor carries only "tooltip manga<N>" as its class.
+
+AP_PROFILE_HTML = """
+<html><body>
+<ul class="statList">
+  <li class="status1">
+    <a href="/users/nawid3333/manga/read"><span class="slCount">0</span><span class="slLabel">read</span></a>
+  </li>
+  <li class="status2">
+    <a href="/users/nawid3333/manga/reading"><span class="slCount">2</span><span class="slLabel">reading</span></a>
+  </li>
+  <li class="status4">
+    <a href="/users/nawid3333/manga/wanttoread">
+      <span class="slCount">1,234</span><span class="slLabel">want to read</span>
+    </a>
+  </li>
+  <li class="status5">
+    <a href="/users/nawid3333/manga/stalled"><span class="slCount">3</span><span class="slLabel">stalled</span></a>
+  </li>
+</ul>
+<ul class="statList">
+  <li class="status1">
+    <a href="/users/nawid3333/anime/watched"><span class="slCount">7</span><span class="slLabel">watched</span></a>
+  </li>
+</ul>
+</body></html>
+"""
+
+
+class TestAnimePlanetProfileParsing(unittest.TestCase):
+    def test_only_non_empty_lists_are_returned(self):
+        infos = mu._ap_parse_profile_list_counts(AP_PROFILE_HTML)
+        keys = [key for key, _href, _label, _count in infos]
+        self.assertEqual(
+            keys,
+            ["manga/reading", "manga/wanttoread", "manga/stalled", "anime/watched"],
+            "the count-0 list must be skipped, and both sections must be read",
+        )
+
+    def test_counts_are_returned_as_integers(self):
+        infos = mu._ap_parse_profile_list_counts(AP_PROFILE_HTML)
+        counts = {key: count for key, _href, _label, count in infos}
+        self.assertEqual(counts["manga/reading"], 2)
+        self.assertEqual(counts["anime/watched"], 7)
+
+    def test_comma_formatted_counts_are_understood(self):
+        """The site formats thousands with a comma; int('1,234') raises."""
+        infos = mu._ap_parse_profile_list_counts(AP_PROFILE_HTML)
+        counts = {key: count for key, _href, _label, count in infos}
+        self.assertEqual(counts["manga/wanttoread"], 1234)
+
+    def test_labels_are_mapped_through_ap_list_types(self):
+        infos = mu._ap_parse_profile_list_counts(AP_PROFILE_HTML)
+        labels = {key: label for key, _href, label, _count in infos}
+        self.assertEqual(labels["manga/wanttoread"], "Want to Read")
+        self.assertEqual(labels["anime/watched"], "Watched")
+
+    def test_every_list_section_of_the_profile_is_read(self):
+        """The profile carries one statList per section; only the first used
+        to be parsed, so every anime list of an account with both was
+        silently dropped."""
+        infos = mu._ap_parse_profile_list_counts(AP_PROFILE_HTML)
+        self.assertTrue(any(key.startswith("anime/") for key, _h, _l, _c in infos))
+
+    def test_an_unknown_list_url_keeps_a_derived_label(self):
+        html = """
+        <ul class="statList">
+          <li class="status9">
+            <a href="/users/nawid3333/manga/new-list-kind">
+              <span class="slCount">4</span><span class="slLabel">new kind</span>
+            </a>
+          </li>
+        </ul>
+        """
+        infos = mu._ap_parse_profile_list_counts(html)
+        self.assertEqual(len(infos), 1)
+        key, href, label, count = infos[0]
+        self.assertEqual(key, "manga/new-list-kind")
+        self.assertEqual(href, "/users/nawid3333/manga/new-list-kind")
+        self.assertEqual(label, "Manga New List Kind")
+        self.assertEqual(count, 4)
+
+    def test_malformed_items_are_skipped_not_fatal(self):
+        html = """
+        <ul class="statList">
+          <li class="status1">
+            <a href="/users/nawid3333/manga/read"><span class="slCount">nope</span><span class="slLabel">read</span></a>
+          </li>
+          <li class="status2"><a href="/users/nawid3333/manga/reading"><span class="slLabel">no count</span></a></li>
+          <li class="status3"><span class="slCount">9</span></li>
+          <li class="status4">
+            <a href="/users/nawid3333/manga/dropped">
+              <span class="slCount">1</span><span class="slLabel">dropped</span>
+            </a>
+          </li>
+        </ul>
+        """
+        infos = mu._ap_parse_profile_list_counts(html)
+        self.assertEqual([key for key, _h, _l, _c in infos], ["manga/dropped"])
+
+    def test_an_item_with_a_zero_count_is_not_reported_as_an_error(self):
+        html = """
+        <ul class="statList">
+          <li class="status1">
+            <a href="/users/nawid3333/manga/read"><span class="slCount">0</span><span class="slLabel">read</span></a>
+          </li>
+        </ul>
+        """
+        self.assertEqual(mu._ap_parse_profile_list_counts(html), [])
+
+    def test_empty_or_unrecognisable_pages_yield_no_lists(self):
+        self.assertEqual(mu._ap_parse_profile_list_counts(""), [])
+        self.assertEqual(mu._ap_parse_profile_list_counts("   "), [])
+        self.assertEqual(mu._ap_parse_profile_list_counts("<p>no lists here</p>"), [])
+
+
+def _ap_card(entry_id: int, title: str, href: str = "/manga/example", cls="tooltip mangaX") -> str:
+    return f"""
+    <li data-type="manga" data-id="{entry_id}" class="card">
+      <a class="{cls}" href="{href}">
+        <h3 class='cardName'>{title}</h3>
+      </a>
+    </li>
+    """
+
+
+class TestAnimePlanetListEntryParsing(unittest.TestCase):
+    def _entries(self, *cards: str) -> list[dict]:
+        return mu._ap_parse_list_entries(f'<ul class="cardDeck cardGrid">{"".join(cards)}</ul>')
+
+    def test_entries_are_shaped_like_mangaupdates_items(self):
+        """The whole point of the shape: every helper built for option 1 --
+        get_series_ids, compare_exports, save_exports -- works on these
+        entries unchanged."""
+        entries = self._entries(_ap_card(91756, "Some Manga", "/manga/some-manga"))
+        self.assertEqual(mu.get_series_ids(entries), {91756: "Some Manga"})
+
+    def test_relative_urls_get_the_site_prefix(self):
+        entries = self._entries(_ap_card(1, "Some Manga", "/manga/some-manga"))
+        self.assertEqual(entries[0]["record"]["series"]["url"], "https://www.anime-planet.com/manga/some-manga")
+
+    def test_absolute_urls_are_kept_as_they_came(self):
+        entries = self._entries(_ap_card(1, "Some Manga", "https://www.anime-planet.com/manga/x"))
+        self.assertEqual(entries[0]["record"]["series"]["url"], "https://www.anime-planet.com/manga/x")
+
+    def test_the_tooltip_class_is_matched_even_without_a_pl0_class(self):
+        """The live cards carry only 'tooltip manga<N>'; demanding 'pl0' too
+        used to miss every link and export every URL as an empty string."""
+        entries = self._entries(_ap_card(2, "Real Class", "/manga/real-class"))
+        self.assertEqual(entries[0]["record"]["series"]["url"], "https://www.anime-planet.com/manga/real-class")
+
+    def test_titles_are_unescaped_and_whitespace_collapsed_by_the_parser(self):
+        entries = self._entries(_ap_card(3, "Attack &amp;   Titans", "/manga/a"))
+        self.assertEqual(entries[0]["record"]["series"]["title"], "Attack &   Titans")
+
+    def test_cards_without_a_usable_title_are_skipped(self):
+        entry = '<li data-type="manga" data-id="4" class="card"><a class="tooltip" href="/manga/x"></a></li>'
+        self.assertEqual(self._entries(entry), [])
+
+    def test_cards_with_a_non_numeric_id_are_skipped(self):
+        entry = (
+            '<li data-type="manga" data-id="abc" class="card">'
+            '<a class="tooltip" href="/manga/x"><h3 class=\'cardName\'>T</h3></a></li>'
+        )
+        self.assertEqual(self._entries(entry), [])
+
+    def test_cards_are_read_from_every_carddeck_on_the_page(self):
+        html = f"""
+        <ul class="cardDeck cardGrid">{_ap_card(1, "A", "/manga/a")}</ul>
+        <ul class="cardDeck cardGrid">{_ap_card(2, "B", "/manga/b")}</ul>
+        """
+        self.assertEqual(len(mu._ap_parse_list_entries(html)), 2)
+
+    def test_cards_without_data_attributes_are_skipped(self):
+        entry = '<li class="card"><a class="tooltip" href="/manga/x"><h3 class=\'cardName\'>T</h3></a></li>'
+        self.assertEqual(self._entries(entry), [])
+
+    def test_a_page_without_cards_yields_no_entries(self):
+        self.assertEqual(mu._ap_parse_list_entries("<p>nothing here</p>"), [])
+        self.assertEqual(mu._ap_parse_list_entries(""), [])
+
+
+class _FakeApApiResponse:
+    """Stands in for httpx.Response with a .text body and status checking."""
+
+    def __init__(self, status_code: int, text: str) -> None:
+        self.status_code = status_code
+        self.text = text
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"error {self.status_code}",
+                request=httpx.Request("GET", "https://www.anime-planet.com/"),
+                response=None,
+            )
+        return self
+
+
+class _ApFakeClient:
+    """Stands in for _AnimePlanetClient, scripted per (list_type, page).
+
+    `spec` maps list_type -> {page: html}. A page missing from the spec
+    returns a 404, exercising the raise_for_status path.
+    """
+
+    def __init__(self, spec: dict[str, dict[int, str]]) -> None:
+        self.spec = spec
+        self.calls: list[tuple[str, int]] = []
+
+    def get(self, path, params=None):  # noqa: ARG002
+        parts = path.split("/")
+        # /users/<name>/<list_type...>
+        list_type = "/".join(parts[3:])
+        page = (params or {}).get("page", 1)
+        self.calls.append((list_type, page))
+        pages = self.spec.get(list_type, {})
+        status = 200 if page in pages else 404
+        return _FakeApApiResponse(status, pages.get(page, ""))
+
+
+class TestAnimePlanetFetchAllListEntries(unittest.TestCase):
+    def test_all_entries_of_a_single_page_list_come_back_in_card_order(self):
+        html = f'<ul class="cardDeck cardGrid">{_ap_card(3, "C", "/manga/c")}{_ap_card(1, "A", "/manga/a")}</ul>'
+        client = _ApFakeClient({"manga/reading": {1: html}})
+
+        entries = mu._ap_fetch_all_list_entries(client, "u", "manga/reading", 2)
+
+        self.assertEqual(mu.get_series_ids(entries), {3: "C", 1: "A"})
+
+    def test_pages_are_joined_in_page_order_not_completion_order(self):
+        """The export's item order used to depend on which request finished
+        first, so a large list's diff read as every item moved. Pages must
+        be concatenated 1..N whatever the completion order."""
+        spec = {
+            "manga/reading": {
+                1: f'<ul class="cardDeck cardGrid">{_ap_card(1, "P1A")}{_ap_card(2, "P1B")}</ul>',
+                2: f'<ul class="cardDeck cardGrid">{_ap_card(3, "P2A")}{_ap_card(4, "P2B")}</ul>',
+            }
+        }
+        client = _ApFakeClient(spec)
+
+        # 561 reported items span two 560-per-page pages.
+        entries = mu._ap_fetch_all_list_entries(client, "u", "manga/reading", 561)
+
+        self.assertEqual([e["record"]["series"]["id"] for e in entries], [1, 2, 3, 4])
+
+    def test_every_page_is_fetched_when_the_count_spans_pages(self):
+        html = '<ul class="cardDeck cardGrid"></ul>'
+        client = _ApFakeClient({"manga/reading": dict.fromkeys((1, 2, 3), html)})
+
+        entries = mu._ap_fetch_all_list_entries(client, "u", "manga/reading", 1201)
+
+        self.assertEqual(mu.get_series_ids(entries), {})
+        self.assertEqual(sorted(client.calls), [("manga/reading", 1), ("manga/reading", 2), ("manga/reading", 3)])
+
+    def test_pages_are_fetched_in_parallel_not_one_after_another(self):
+        """The two-page fetch must actually use its worker pool; with the
+        pages scripted to sleep briefly, a serial fetch takes 2x the sleep
+        and this assertion (Option 1's overlap probe, reused) catches it."""
+        import time as _time
+
+        intervals = []
+        _lock = threading.Lock()
+
+        class TimedPage(_ApFakeClient):
+            def get(self, path, params=None):  # noqa: ARG002
+                start = _time.perf_counter()
+                _time.sleep(0.05)
+                with _lock:
+                    intervals.append((start, _time.perf_counter()))
+                return super().get(path, params)
+
+        spec = {
+            "manga/reading": {
+                1: f'<ul class="cardDeck cardGrid">{_ap_card(1, "P1A", "/manga/p1a")}</ul>',
+                2: f'<ul class="cardDeck cardGrid">{_ap_card(2, "P2A", "/manga/p2a")}</ul>',
+            }
+        }
+
+        with patch.object(mu, "LIST_PAGE_WORKERS", 4):
+            mu._ap_fetch_all_list_entries(TimedPage(spec), "u", "manga/reading", 561)
+
+        self.assertGreaterEqual(_peak_overlap(intervals), 2, "page 2 was fetched one after another")
+
+    def test_a_failing_page_aborts_rather_than_exporting_a_short_list(self):
+        class BrokenPage(_ApFakeClient):
+            def get(self, path, params=None):  # noqa: ARG002
+                resp = super().get(path, params)
+                resp.raise_for_status()
+                return resp
+
+        spec = {"manga/reading": {1: '<ul class="cardDeck cardGrid"></ul>', 2: '<ul class="cardDeck cardGrid"></ul>'}}
+        client = BrokenPage({"manga/reading": {1: spec["manga/reading"][1]}})  # page 2 -> 404
+
+        with self.assertRaises(httpx.HTTPStatusError):
+            mu._ap_fetch_all_list_entries(client, "u", "manga/reading", 1201)
+
+    def test_zero_and_negative_counts_fetch_nothing(self):
+        client = _ApFakeClient({})
+        self.assertEqual(mu._ap_fetch_all_list_entries(client, "u", "manga/reading", 0), [])
+        self.assertEqual(mu._ap_fetch_all_list_entries(client, "u", "manga/reading", -5), [])
+        self.assertEqual(client.calls, [])
+
+
+class TestAnimePlanetPagesNeeded(unittest.TestCase):
+    def test_counts_at_or_below_one_page_need_one_page(self):
+        self.assertEqual(mu._ap_pages_needed(0, 560), 0)
+        self.assertEqual(mu._ap_pages_needed(1, 560), 1)
+        self.assertEqual(mu._ap_pages_needed(560, 560), 1)
+
+    def test_one_item_over_a_page_boundary_adds_exactly_one_page(self):
+        self.assertEqual(mu._ap_pages_needed(561, 560), 2)
+
+    def test_a_non_positive_count_needs_no_pages(self):
+        self.assertEqual(mu._ap_pages_needed(-1, 560), 0)
+
+
 # ==================== related-series discovery ====================
 class _FakeApiResponse(httpx.Response):
     def __init__(self, status_code, body):

@@ -13,8 +13,10 @@ from datetime import datetime, timedelta
 from typing import Any, Protocol
 
 import httpx
+import lxml.html as lh
 
 from config.config import (
+    AP_USERNAME,
     API_BASE_URL,
     EXPORTS_DIR,
     ITEMS_PER_PAGE,
@@ -1425,6 +1427,7 @@ def show_menu() -> None:
     print("  1. Scan my lists (export + compare with last run)")
     print("  2. Check related series not already in your lists")
     print("  3. Check Wish List for finished/cancelled series (ready to read)")
+    print("  4. Scan my Anime-Planet lists (export + compare with last run)")
     print("  0. Exit\n")
 
 
@@ -1512,6 +1515,278 @@ def run_finished_check(client: _ClientLike) -> None:
     log.info("Ready-to-read report saved to: %s (%d of %d found)", path, len(finished), len(items))
 
 
+# ==================== Anime-Planet ====================
+
+AP_BASE_URL = "https://www.anime-planet.com"
+AP_LIST_TYPES = {
+    "manga/read": "Read",
+    "manga/reading": "Reading",
+    "manga/wanttoread": "Want to Read",
+    "manga/stalled": "Stalled",
+    "manga/dropped": "Dropped",
+    "manga/wontread": "Won't Read",
+    "anime/watched": "Watched",
+    "anime/watching": "Watching",
+    "anime/wanttowatch": "Want to Watch",
+    "anime/stalled": "Stalled",
+    "anime/dropped": "Dropped",
+    "anime/wontwatch": "Won't Watch",
+}
+
+
+class _AnimePlanetClient:
+    """Minimal httpx wrapper for anonymous Anime-Planet requests."""
+
+    _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+
+    def __init__(self) -> None:
+        # Deliberately NOT the shared main() client: that one carries the
+        # MangaUpdates session, and httpx merges client-level headers into
+        # every request, so the "Authorization: Bearer ..." set after login
+        # went to anime-planet.com too -- which answered 401 Unauthorized.
+        # (Setting a header to None in per-request headers, httpx's documented
+        # way to *remove* one, is rejected by this version with
+        # "Header value must be str or bytes".) A dedicated client has no
+        # MangaUpdates state to leak, and its cookie jar stays Anime-Planet's.
+        self.client = httpx.Client(
+            timeout=30,
+            follow_redirects=True,
+            headers={"User-Agent": self._UA},
+        )
+
+    def get(self, path: str, params: dict[str, Any] | None = None) -> httpx.Response:
+        url = f"{AP_BASE_URL}{path}" if path.startswith("/") else f"{AP_BASE_URL}/{path}"
+        return self.client.get(url, params=params)
+
+    def close(self) -> None:
+        self.client.close()
+
+
+def _ap_user_profile_path(username: str) -> str:
+    if not username:
+        raise ValueError("Anime-Planet username is not configured")
+    return f"/users/{username}"
+
+
+def _ap_list_path(username: str, list_type: str) -> str:
+    return f"/users/{username}/{list_type}"
+
+
+def _ap_parse_profile_list_counts(page_html: str) -> list[tuple[str, str, str, int]]:
+    """Parse the profile statLists and return non-empty lists.
+
+    The profile carries one statList per section (manga, anime); reading only
+    the first would have silently dropped every anime list of an account
+    with both. Returns tuples of (list_type, relative_url, label, count).
+    Only lists with a non-zero count are returned so the scraper can skip
+    empty ones entirely.
+    """
+    results: list[tuple[str, str, str, int]] = []
+    if not page_html or not page_html.strip():
+        return results
+    doc = lh.fromstring(page_html)
+    items = [
+        li
+        for stat_list in doc.xpath('//ul[contains(@class, "statList")]')
+        for li in stat_list.xpath('.//li[contains(@class, "status")]')
+    ]
+    for item in items:
+        link = item.xpath("./a")
+        if not link:
+            continue
+        anchor = link[0]
+        href = anchor.get("href", "")
+        if not href:
+            continue
+        count_text = anchor.xpath('.//span[@class="slCount"]/text()')
+        label_text = anchor.xpath('.//span[@class="slLabel"]/text()')
+        if not count_text or not label_text:
+            continue
+        # Anime-Planet formats counts in the thousands with a comma
+        # ("1,234"); int() rejects that and would silently drop the list.
+        try:
+            count = int(count_text[0].strip().replace(",", ""))
+        except ValueError:
+            continue
+        if count <= 0:
+            continue
+        # Map the URL tail back to the canonical list type key.
+        key = href.lstrip("/")
+        if key.startswith("users/"):
+            key = key.split("/", 2)[-1]
+        if key not in AP_LIST_TYPES:
+            # Unknown list URL: keep it so a future site change is visible,
+            # but derive a readable label from the URL if needed.
+            derived_label = key.replace("/", " ").replace("-", " ").title()
+            results.append((key, href, derived_label, count))
+        else:
+            results.append((key, href, AP_LIST_TYPES[key], count))
+    return results
+
+
+def _ap_parse_list_entries(page_html: str) -> list[dict]:
+    """Extract entries from an Anime-Planet list page HTML.
+
+    Each entry is shaped exactly like a MangaUpdates list item
+    ("record.series") so save_exports, compare_exports, and every
+    id/title/url extraction built for option 1 work on it unchanged.
+    """
+    entries: list[dict] = []
+    if not page_html or not page_html.strip():
+        return entries
+    doc = lh.fromstring(page_html)
+    cards = [
+        card
+        for deck in doc.xpath('//ul[contains(@class, "cardDeck") and contains(@class, "cardGrid")]')
+        for card in deck.xpath("./li[@data-type and @data-id]")
+    ]
+    for card in cards:
+        entry_id = card.get("data-id", "")
+        title_el = card.xpath(".//h3[@class='cardName']")
+        title = title_el[0].text_content().strip() if title_el else ""
+        if not entry_id or not title:
+            continue
+        try:
+            numeric_id = int(entry_id)
+        except ValueError:
+            continue
+        # 'pl0' used to be demanded alongside 'tooltip', but the live cards
+        # carry only "tooltip manga<N>" -- so every link lookup missed and
+        # every exported URL came back empty. Match the class the site
+        # actually sends.
+        link = card.xpath(".//a[contains(@class, 'tooltip')]")
+        path = link[0].get("href", "") if link else ""
+        # A relative href gets the site prefix; an absolute one is kept as
+        # it came instead of being welded onto AP_BASE_URL.
+        url = f"{AP_BASE_URL}{path}" if path.startswith("/") else path
+        entries.append({"record": {"series": {"id": numeric_id, "title": title, "url": url}}})
+    return entries
+
+
+def _ap_fetch_list_page(
+    ap_client: _AnimePlanetClient, username: str, list_type: str, page: int, per_page: int
+) -> list[dict]:
+    """Fetch a single page of an Anime-Planet list."""
+    params = {}
+    if page > 1:
+        params["page"] = page
+    if per_page != 35:
+        params["per_page"] = per_page
+    resp = ap_client.get(_ap_list_path(username, list_type), params=params)
+    resp.raise_for_status()
+    return _ap_parse_list_entries(resp.text)
+
+
+def _ap_pages_needed(count: int, per_page: int) -> int:
+    if count <= 0:
+        return 0
+    return max(1, (count + per_page - 1) // per_page)
+
+
+def _ap_fetch_all_list_entries(ap_client: _AnimePlanetClient, username: str, list_type: str, count: int) -> list[dict]:
+    """Fetch every page of an Anime-Planet list and return the entries."""
+    per_page = 560
+    pages = _ap_pages_needed(count, per_page)
+    entries: list[dict] = []
+    if pages == 0:
+        return entries
+    if pages == 1:
+        entries.extend(_ap_fetch_list_page(ap_client, username, list_type, 1, per_page))
+        return entries
+    jobs = [(username, list_type, page, per_page) for page in range(1, pages + 1)]
+    with _worker_pool(min(LIST_PAGE_WORKERS, len(jobs))) as pool:
+        # pool.map keeps page order, the way export_list assembles MangaUpdates
+        # pages; the earlier as_completed loop appended in completion order,
+        # so a large list's items landed in the export in a different order
+        # every run and the diffs read as huge spurious changes.
+        for page_entries in pool.map(lambda job: _ap_fetch_list_page(ap_client, *job), jobs):
+            entries.extend(page_entries)
+    return entries
+
+
+def _ap_export_all_lists(ap_client: _AnimePlanetClient, username: str) -> dict[str, list[dict]]:
+    """Export every non-empty Anime-Planet list for a user."""
+    log.info("Fetching Anime-Planet profile for '%s'...", username)
+    profile_resp = ap_client.get(_ap_user_profile_path(username))
+    profile_resp.raise_for_status()
+    list_infos = _ap_parse_profile_list_counts(profile_resp.text)
+    if not list_infos:
+        log.warning("No non-empty Anime-Planet lists found for '%s'", username)
+        return {}
+
+    # _ap_parse_profile_list_counts walks the profile's statList in document
+    # order, so this summary reads top-to-bottom in the order the site itself
+    # shows the lists -- the same "Found N list(s): titles" shape as
+    # fetch_lists for MangaUpdates lists.
+    log.info(
+        "Found %d non-empty list(s): %s",
+        len(list_infos),
+        ", ".join(label for _key, _href, label, _count in list_infos),
+    )
+
+    log.info("Exporting lists...")
+    exports: dict[str, list[dict]] = {}
+    for list_type, _href, label, count in list_infos:
+        items = _ap_fetch_all_list_entries(ap_client, username, list_type, count)
+        log.info("  %s: %d item(s)", label, len(items))
+        if len(items) < count:
+            # The site may cap per_page below what was asked, so a shortfall
+            # is not fatal -- but it must not pass unnoticed: the next run
+            # would diff against the short list and report the missing items
+            # as removed from the account.
+            log.warning(
+                "  %s: got %d of the %d item(s) the profile reported – list may be incomplete",
+                label,
+                len(items),
+                count,
+            )
+        exports[label] = items
+    return exports
+
+
+def run_anime_planet_scan(client: _ClientLike) -> None:
+    """Option 4: export Anime-Planet lists and diff against previous run."""
+    if not AP_USERNAME:
+        log.error("AP_USERNAME is not set in .env — configure it to use Option 4")
+        return
+
+    start_time = time.time()
+    ap_client = _AnimePlanetClient()
+    try:
+        exports = _ap_export_all_lists(ap_client, AP_USERNAME)
+    except httpx.HTTPError as exc:
+        log.error("Could not reach Anime-Planet: %s", exc)
+        return
+    finally:
+        ap_client.close()
+
+    if not exports:
+        log.warning("No Anime-Planet lists to export")
+        return
+
+    log.info("Saving exports...")
+    folder = save_exports(exports)
+    log.info("Exports saved to: %s", folder)
+
+    try:
+        has_changes = compare_exports(folder, exports)
+    finally:
+        rotate_exports()
+
+    if not has_changes:
+        log.info("Run ended with no changes since previous export.")
+
+    elapsed = time.time() - start_time
+    total_items = sum(len(items) for items in exports.values())
+    log.info("")
+    for line in _box(
+        [
+            term.title(f"  📊 Summary: {len(exports)} list(s), {total_items} item(s), in {elapsed:.1f}s"),
+        ]
+    ):
+        log.info(line)
+
+
 def main():
     print_header()
 
@@ -1532,12 +1807,17 @@ def main():
         client.headers["Authorization"] = f"Bearer {token}"
         log.info("Logged in as: %s", USERNAME)
 
-        actions = {"1": run_scan_lists, "2": run_related_check, "3": run_finished_check}
+        actions = {
+            "1": run_scan_lists,
+            "2": run_related_check,
+            "3": run_finished_check,
+            "4": run_anime_planet_scan,
+        }
         try:
             while True:
                 show_menu()
                 try:
-                    choice = input("Enter your choice (0-3): ").strip()
+                    choice = input("Enter your choice (0-4): ").strip()
                 except (EOFError, KeyboardInterrupt):
                     # Ctrl+C or a closed stdin at the prompt is a way of
                     # saying "done", not a crash worth a traceback.
@@ -1551,7 +1831,7 @@ def main():
 
                 action = actions.get(choice)
                 if action is None:
-                    print("✗ Invalid choice. Please enter a number between 0 and 3.")
+                    print("✗ Invalid choice. Please enter a number between 0 and 4.")
                     continue
 
                 try:
