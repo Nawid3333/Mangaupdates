@@ -16,6 +16,7 @@ import httpx
 import lxml.html as lh
 
 from config.config import (
+    AP_EXPORTS_DIR,
     AP_USERNAME,
     API_BASE_URL,
     EXPORTS_DIR,
@@ -513,8 +514,17 @@ def load_manifest(folder: str, titles) -> dict[str, str]:
     return export_filenames(titles)
 
 
-def save_exports(exports: dict[str, list[dict]]) -> str:
-    """Save each list to a timestamped folder. Returns the folder path."""
+def save_exports(exports: dict[str, list[dict]], exports_dir: str | None = None) -> str:
+    """Save each list to a timestamped folder. Returns the folder path.
+
+    exports_dir scopes the snapshot tree: option 1 uses the default
+    (MangaUpdates) folder and option 4 passes its own, so the two sites'
+    exports never diff against each other and rotation stays per site.
+    None reads config's EXPORTS_DIR at call time -- a bound default would
+    have frozen the import-time path and ignored every test/override.
+    """
+    if exports_dir is None:
+        exports_dir = EXPORTS_DIR
     # Two runs inside the same second produce the same folder name, and
     # os.replace onto an existing non-empty directory fails -- on Windows
     # with PermissionError. The run would then die *after* every list had
@@ -523,11 +533,11 @@ def save_exports(exports: dict[str, list[dict]]) -> str:
     # keeps working for ordering and rotation.
     stamp = datetime.now()
     folder_name = stamp.strftime(EXPORT_FOLDER_FORMAT)
-    folder_path = os.path.join(EXPORTS_DIR, folder_name)
+    folder_path = os.path.join(exports_dir, folder_name)
     while os.path.exists(folder_path):
         stamp += timedelta(seconds=1)
         folder_name = stamp.strftime(EXPORT_FOLDER_FORMAT)
-        folder_path = os.path.join(EXPORTS_DIR, folder_name)
+        folder_path = os.path.join(exports_dir, folder_name)
 
     # Write into a temporary folder first and only reveal it under its final
     # name once every file has been written successfully. Writing directly
@@ -548,9 +558,9 @@ def save_exports(exports: dict[str, list[dict]]) -> str:
     # save_finished_series build their reports with mkstemp(suffix=".tmp") in
     # this same folder, and only directories were being swept, so a crash
     # mid-report left a stray file that nothing would ever remove.
-    if os.path.isdir(EXPORTS_DIR):
-        for entry in os.listdir(EXPORTS_DIR):
-            entry_path = os.path.join(EXPORTS_DIR, entry)
+    if os.path.isdir(exports_dir):
+        for entry in os.listdir(exports_dir):
+            entry_path = os.path.join(exports_dir, entry)
             if entry_path == tmp_folder_path or not entry.endswith(".tmp"):
                 continue
             with contextlib.suppress(OSError):
@@ -1143,8 +1153,12 @@ def _is_export_folder(name: str) -> bool:
     return True
 
 
-def _export_folders() -> list[str]:
-    """Every export snapshot in EXPORTS_DIR, oldest first.
+def _export_folders(exports_dir: str | None = None) -> list[str]:
+    """Every export snapshot in exports_dir, oldest first.
+
+    exports_dir defaults to config's EXPORTS_DIR, read at call time (a
+    default-argument binding would have frozen the import-time value and
+    silently ignored every override of EXPORTS_DIR).
 
     find_previous_export and rotate_exports each used to decide for
     themselves what counted, and both accepted *any* directory. That was
@@ -1154,22 +1168,30 @@ def _export_folders() -> list[str]:
     comparison would happily diff against it and report every series as new.
     Deciding it once, here, is the only way the two can agree.
     """
-    if not os.path.isdir(EXPORTS_DIR):
+    if exports_dir is None:
+        exports_dir = EXPORTS_DIR
+    if not os.path.isdir(exports_dir):
         return []
     names = [
         name
-        for name in os.listdir(EXPORTS_DIR)
-        if _is_export_folder(name) and os.path.isdir(os.path.join(EXPORTS_DIR, name))
+        for name in os.listdir(exports_dir)
+        if _is_export_folder(name) and os.path.isdir(os.path.join(exports_dir, name))
     ]
     return sorted(names, key=_parse_folder_date)
 
 
 def find_previous_export(current_folder: str) -> str | None:
-    """Find the most recent export folder before current_folder."""
+    """Find the most recent export folder before current_folder.
+
+    Scopes the search to the current folder's own tree: each site has its
+    own export base, and a MangaUpdates run must never be diffed against an
+    Anime-Planet snapshot sitting alongside it.
+    """
     current_dt = _parse_folder_date(os.path.basename(current_folder))
-    folders = [name for name in _export_folders() if _parse_folder_date(name) < current_dt]
+    exports_dir = os.path.dirname(current_folder)
+    folders = [name for name in _export_folders(exports_dir) if _parse_folder_date(name) < current_dt]
     if folders:
-        return os.path.join(EXPORTS_DIR, folders[-1])
+        return os.path.join(exports_dir, folders[-1])
     return None
 
 
@@ -1396,19 +1418,25 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
     return has_changes
 
 
-def rotate_exports() -> None:
-    """Keep only the newest MAX_EXPORTS folders, delete the rest."""
-    if not os.path.isdir(EXPORTS_DIR):
+def rotate_exports(exports_dir: str | None = None) -> None:
+    """Keep only the newest MAX_EXPORTS folders, delete the rest.
+
+    None reads config's EXPORTS_DIR at call time, matching _export_folders
+    and save_exports -- a bound default would freeze the import-time path.
+    """
+    if exports_dir is None:
+        exports_dir = EXPORTS_DIR
+    if not os.path.isdir(exports_dir):
         return
 
-    # Only this program's own snapshots. Anything else in exports/ -- a
+    # Only this program's own snapshots. Anything else in exports_dir -- a
     # folder the user put there, one from another tool -- is not ours to
     # count or delete.
-    folders = _export_folders()
+    folders = _export_folders(exports_dir)
 
     while len(folders) > MAX_EXPORTS:
         oldest = folders.pop(0)
-        path = os.path.join(EXPORTS_DIR, oldest)
+        path = os.path.join(exports_dir, oldest)
         try:
             shutil.rmtree(path)
             log.info("Deleted old export: %s", oldest)
@@ -1765,13 +1793,13 @@ def run_anime_planet_scan(client: _ClientLike) -> None:
         return
 
     log.info("Saving exports...")
-    folder = save_exports(exports)
+    folder = save_exports(exports, AP_EXPORTS_DIR)
     log.info("Exports saved to: %s", folder)
 
     try:
         has_changes = compare_exports(folder, exports)
     finally:
-        rotate_exports()
+        rotate_exports(AP_EXPORTS_DIR)
 
     if not has_changes:
         log.info("Run ended with no changes since previous export.")

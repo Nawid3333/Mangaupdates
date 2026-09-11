@@ -61,8 +61,14 @@ PASSWORD = os.getenv("MU_PASSWORD", "")
 # Anime-Planet
 AP_USERNAME = os.getenv("AP_USERNAME", "")
 
-# Paths
+# Paths. MangaUpdates and Anime-Planet get separate export trees: option 1
+# and option 4 share compare_exports/rotate_exports, and with one shared
+# folder every run diffed against whichever site ran last -- a MangaUpdates
+# run after an Anime-Planet run reported every MangaUpdates list as "NEW
+# LIST" and every Anime-Planet list as "REMOVED" (and vice versa). Each
+# site's own tree keeps its diffs and MAX_EXPORTS rotation independent.
 EXPORTS_DIR = os.path.join(BASE_DIR, "exports")
+AP_EXPORTS_DIR = os.path.join(BASE_DIR, "exports", "anime-planet")
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
 
 # Ensure directories exist
