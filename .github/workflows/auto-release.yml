@@ -29,7 +29,7 @@ name: Auto Release
 
 on:
   workflow_run:
-    workflows: ["CI"]
+    workflows: ['CI']
     types: [completed]
 
 concurrency:
@@ -65,8 +65,8 @@ jobs:
         uses: python-semantic-release/python-semantic-release@v10.6.2
         with:
           github_token: ${{ secrets.RELEASE_PAT }}
-          git_committer_name: "github-actions[bot]"
-          git_committer_email: "github-actions[bot]@users.noreply.github.com"
+          git_committer_name: 'github-actions[bot]'
+          git_committer_email: 'github-actions[bot]@users.noreply.github.com'
           build: false
           changelog: false
           commit: true
