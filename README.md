@@ -195,6 +195,7 @@ Option 1's exports are saved to `exports/<timestamp>/` and option 4's to `export
 │   └── config.py            # Paths, API settings, retry/export tuning, logging
 └── tests/
     ├── __init__.py
+    ├── site_check.py        # Monthly live-site check (see Monthly site check)
     └── test_mangaupdates.py # Unit + regression tests
 ```
 
@@ -234,6 +235,25 @@ python -m unittest discover -s tests
 Line coverage of `main.py` is 99% — the only uncovered line is the `sys.exit(_run_cli())` call itself, which no test can execute.
 
 Runs offline — no credentials or network access needed. Covers filename collision handling (including the case-insensitive-filesystem variant), the export manifest, crash-safety of `save_exports` (including recovering from a previous crashed run's leftover files), export rotation, the retry/rate-limit logic, related-series discovery (including a genuine wall-clock concurrency proof, not just a correctness check), the Wish List completion check (including the mixed-format trap where one release format says "Complete" while another is still active), Anime-Planet profile and list-page parsing, resilience to malformed API responses and list items, report-ordering reproducibility, and every process exit code the program can produce.
+
+## Monthly site check
+
+`.github/workflows/site-check.yml` runs `tests/site_check.py` on the 3rd of
+every month. It reads the MangaUpdates API and Anime-Planet with this tool's
+own validation and parsers. If one of them would fail, it opens an issue
+labelled `site-check`, and the first passing run closes it again. A site that
+blocks GitHub's runners is reported as unreachable, not as a change. Run it
+yourself any time:
+
+```bash
+python tests/site_check.py
+```
+
+Without credentials it checks a series search and one series' details. With
+`MU_USERNAME` and `MU_PASSWORD` (read from your `.env` locally, or set as
+repository secrets for the workflow) it also logs in and reads the list index
+and one list page; with `AP_USERNAME` it reads that Anime-Planet profile and
+one list. It never changes anything, and its report holds no account details.
 
 ## Requirements
 
