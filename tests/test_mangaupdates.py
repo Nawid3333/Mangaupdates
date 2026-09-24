@@ -16,6 +16,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -1834,7 +1835,7 @@ class _FakeApApiResponse:
             raise httpx.HTTPStatusError(
                 f"error {self.status_code}",
                 request=httpx.Request("GET", "https://www.anime-planet.com/"),
-                response=None,
+                response=httpx.Response(self.status_code),
             )
         return self
 
@@ -1861,12 +1862,17 @@ class _ApFakeClient:
         return _FakeApApiResponse(status, pages.get(page, ""))
 
 
+def _as_ap_client(fake) -> mu._AnimePlanetClient:
+    """Hand a scripted fake to code annotated with the real client class."""
+    return cast(mu._AnimePlanetClient, fake)
+
+
 class TestAnimePlanetFetchAllListEntries(unittest.TestCase):
     def test_all_entries_of_a_single_page_list_come_back_in_card_order(self):
         html = f'<ul class="cardDeck cardGrid">{_ap_card(3, "C", "/manga/c")}{_ap_card(1, "A", "/manga/a")}</ul>'
         client = _ApFakeClient({"manga/reading": {1: html}})
 
-        entries = mu._ap_fetch_all_list_entries(client, "u", "manga/reading", 2)
+        entries = mu._ap_fetch_all_list_entries(_as_ap_client(client), "u", "manga/reading", 2)
 
         self.assertEqual(mu.get_series_ids(entries), {3: "C", 1: "A"})
 
@@ -1883,7 +1889,7 @@ class TestAnimePlanetFetchAllListEntries(unittest.TestCase):
         client = _ApFakeClient(spec)
 
         # 561 reported items span two 560-per-page pages.
-        entries = mu._ap_fetch_all_list_entries(client, "u", "manga/reading", 561)
+        entries = mu._ap_fetch_all_list_entries(_as_ap_client(client), "u", "manga/reading", 561)
 
         self.assertEqual([e["record"]["series"]["id"] for e in entries], [1, 2, 3, 4])
 
@@ -1891,7 +1897,7 @@ class TestAnimePlanetFetchAllListEntries(unittest.TestCase):
         html = '<ul class="cardDeck cardGrid"></ul>'
         client = _ApFakeClient({"manga/reading": dict.fromkeys((1, 2, 3), html)})
 
-        entries = mu._ap_fetch_all_list_entries(client, "u", "manga/reading", 1201)
+        entries = mu._ap_fetch_all_list_entries(_as_ap_client(client), "u", "manga/reading", 1201)
 
         self.assertEqual(mu.get_series_ids(entries), {})
         self.assertEqual(sorted(client.calls), [("manga/reading", 1), ("manga/reading", 2), ("manga/reading", 3)])
@@ -1921,7 +1927,7 @@ class TestAnimePlanetFetchAllListEntries(unittest.TestCase):
         }
 
         with patch.object(mu, "LIST_PAGE_WORKERS", 4):
-            mu._ap_fetch_all_list_entries(TimedPage(spec), "u", "manga/reading", 561)
+            mu._ap_fetch_all_list_entries(_as_ap_client(TimedPage(spec)), "u", "manga/reading", 561)
 
         self.assertGreaterEqual(_peak_overlap(intervals), 2, "page 2 was fetched one after another")
 
@@ -1936,12 +1942,12 @@ class TestAnimePlanetFetchAllListEntries(unittest.TestCase):
         client = BrokenPage({"manga/reading": {1: spec["manga/reading"][1]}})  # page 2 -> 404
 
         with self.assertRaises(httpx.HTTPStatusError):
-            mu._ap_fetch_all_list_entries(client, "u", "manga/reading", 1201)
+            mu._ap_fetch_all_list_entries(_as_ap_client(client), "u", "manga/reading", 1201)
 
     def test_zero_and_negative_counts_fetch_nothing(self):
         client = _ApFakeClient({})
-        self.assertEqual(mu._ap_fetch_all_list_entries(client, "u", "manga/reading", 0), [])
-        self.assertEqual(mu._ap_fetch_all_list_entries(client, "u", "manga/reading", -5), [])
+        self.assertEqual(mu._ap_fetch_all_list_entries(_as_ap_client(client), "u", "manga/reading", 0), [])
+        self.assertEqual(mu._ap_fetch_all_list_entries(_as_ap_client(client), "u", "manga/reading", -5), [])
         self.assertEqual(client.calls, [])
 
 
@@ -1974,7 +1980,7 @@ class TestAnimePlanetExportAllLists(unittest.TestCase):
         }
         client = _ApFakeClient(spec)
 
-        exports = mu._ap_export_all_lists(client, "u")
+        exports = mu._ap_export_all_lists(_as_ap_client(client), "u")
 
         self.assertEqual(set(exports.keys()), {"Manga Stalled", "Anime Stalled"})
         self.assertEqual(mu.get_series_ids(exports["Manga Stalled"]), {1: "Manga Series"})
@@ -2004,7 +2010,7 @@ class TestAnimePlanetExportAllLists(unittest.TestCase):
         }
         client = _ApFakeClient(spec)
 
-        exports = mu._ap_export_all_lists(client, "u")
+        exports = mu._ap_export_all_lists(_as_ap_client(client), "u")
 
         self.assertEqual(len(exports), 2, f"a duplicate label silently overwrote a list: {exports.keys()}")
         all_ids = {sid for items in exports.values() for sid in mu.get_series_ids(items)}
