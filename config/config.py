@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import os
 import sys
@@ -6,6 +7,25 @@ from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 
 from src import term
+
+
+def configure_console() -> None:
+    """Make stdout/stderr UTF-8 so a ✓ or ✗ can never crash the program.
+
+    A Windows console that is not using UTF-8 -- a redirected run, or an older
+    terminal -- encodes as cp1252, which has no ✗. On 2026-09-11 that turned a
+    handled error into a crash: the "That option did not finish" message
+    itself raised UnicodeEncodeError. The scrapers do the same thing here.
+
+    Called at import time because this module is the earliest one every entry
+    point (main.py, the test suite) pulls in.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+
+
+configure_console()
 
 # ==================== PROJECT HOME ====================
 # Every path this program reads or writes -- .env, exports/, logs/ -- hangs off

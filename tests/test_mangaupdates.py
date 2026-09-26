@@ -55,6 +55,21 @@ class TempExportsCase(unittest.TestCase):
         mu.EXPORTS_DIR = self._orig_exports_dir
 
 
+# ==================== console encoding ====================
+class TestConfigureConsole(unittest.TestCase):
+    def test_a_cp1252_console_can_print_the_status_marks(self):
+        """2026-09-11: printing "✗ That option did not finish" on a cp1252
+        console raised UnicodeEncodeError from inside the error handler."""
+        from config.config import configure_console
+
+        buf = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+        with patch.object(sys, "stdout", buf):
+            configure_console()
+            print("✓ ✗ → ─ ⚠")
+            buf.flush()
+        self.assertEqual(buf.encoding.lower().replace("-", ""), "utf8")
+
+
 # ==================== sanitize_filename ====================
 class TestSanitizeFilename(unittest.TestCase):
     def test_strips_unsafe_characters(self):
