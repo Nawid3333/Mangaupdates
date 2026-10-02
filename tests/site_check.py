@@ -213,7 +213,13 @@ def check_anime_planet(username: str) -> list[Result]:
             return [Result("Anime-Planet profile", UNREACHABLE, str(exc))]
         if profile.status_code >= 400:
             return [Result("Anime-Planet profile", FAIL, f"HTTP {profile.status_code} for the profile page")]
-        lists = main._ap_parse_profile_list_counts(profile.text)
+        try:
+            counted = main._ap_parse_profile_list_counts(profile.text)
+        except ValueError:
+            # The message names the list's URL, which carries the username.
+            return [Result("Anime-Planet profile", FAIL, "a list count is unreadable, so option 4 would stop")]
+        # Empty lists are returned too; only a non-empty one can show cards.
+        lists = [info for info in counted if info[3] > 0]
         if not lists:
             return [Result("Anime-Planet profile", FAIL, "no list counts found, so option 4 would export nothing")]
         results = [Result("Anime-Planet profile", PASS, f"{len(lists)} non-empty list(s)")]

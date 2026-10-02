@@ -87,6 +87,12 @@ class TestSanitizeFilename(unittest.TestCase):
         # Each unsafe char is individually replaced, so this is NOT empty.
         self.assertEqual(mu.sanitize_filename("///"), "___")
 
+    def test_control_characters_are_replaced(self):
+        """A tab or newline is invalid in a Windows filename; a list title
+        carrying one reached open() unchanged and the save died with OSError
+        22 after every list had been fetched."""
+        self.assertEqual(mu.sanitize_filename("a\tb\nc\x00d"), "a_b_c_d")
+
     def test_two_distinct_titles_can_collide(self):
         """The premise the manifest fix exists for: this collision is real."""
         a, b = "Sci-Fi/Fantasy", "Sci-Fi_Fantasy"
@@ -166,7 +172,7 @@ class TestFilenameCollisionRegression(TempExportsCase):
         exports = {a: [_rec(1, "AAA")], b: [_rec(2, "BBB")]}
         folder = mu.save_exports(exports)
 
-        loaded, unreadable = mu._load_prev_exports(folder, list(exports.keys()))
+        loaded, unreadable = mu._load_prev_exports(folder, mu.load_manifest(folder, list(exports.keys())))
         self.assertEqual(unreadable, set())
         self.assertEqual(mu.get_series_ids(loaded[a]), {1: "AAA"})
         self.assertEqual(mu.get_series_ids(loaded[b]), {2: "BBB"})
@@ -187,10 +193,28 @@ class TestFilenameCollisionRegression(TempExportsCase):
         exports = {a: [_rec(1, "AAA")], b: [_rec(2, "BBB")]}
         folder = mu.save_exports(exports)
 
-        loaded, unreadable = mu._load_prev_exports(folder, list(exports.keys()))
+        loaded, unreadable = mu._load_prev_exports(folder, mu.load_manifest(folder, list(exports.keys())))
         self.assertEqual(unreadable, set())
         self.assertEqual(mu.get_series_ids(loaded[a]), {1: "AAA"})
         self.assertEqual(mu.get_series_ids(loaded[b]), {2: "BBB"})
+
+    def test_a_list_titled_like_the_manifest_keeps_its_own_file(self):
+        """A list titled "_manifest" was written to _manifest.json and then
+        overwritten by the manifest itself: its items were lost from the
+        snapshot."""
+        exports = {"_manifest": [_rec(1, "AAA")], "_MANIFEST": [_rec(2, "BBB")]}
+        folder = mu.save_exports(exports)
+
+        loaded, unreadable = mu._load_prev_exports(folder, mu.load_manifest(folder, list(exports.keys())))
+        self.assertEqual(unreadable, set())
+        self.assertEqual(mu.get_series_ids(loaded["_manifest"]), {1: "AAA"})
+        self.assertEqual(mu.get_series_ids(loaded["_MANIFEST"]), {2: "BBB"})
+
+    def test_a_title_with_a_control_character_saves(self):
+        exports = {"Tab\there": [_rec(1, "AAA")]}
+        folder = mu.save_exports(exports)
+        loaded, _unreadable = mu._load_prev_exports(folder, mu.load_manifest(folder, list(exports.keys())))
+        self.assertEqual(mu.get_series_ids(loaded["Tab\there"]), {1: "AAA"})
 
     def test_manifest_less_folder_from_before_this_fix_still_compares(self):
         old_folder = os.path.join(self.dir.name, "01.01.2026_00-00-00")
@@ -379,6 +403,67 @@ class TestApiRequestRetriesRateLimit(unittest.TestCase):
             mu._api_request(client, "get", "https://example.invalid")
 
         self.assertEqual(client.get.call_count, mu.MAX_RETRIES)
+
+    def test_a_dropped_connection_is_retried(self):
+        """Only timeouts and failed connects were retried. A connection the
+        server dropped mid-answer -- the usual end of a pooled keep-alive
+        connection -- aborted a whole export on the first occurrence."""
+        for error in (
+            httpx.ReadError("connection reset"),
+            httpx.WriteError("broken pipe"),
+            httpx.RemoteProtocolError("Server disconnected without sending a response."),
+        ):
+            with self.subTest(type(error).__name__):
+                ok = self._fake_response(200)
+                client = MagicMock()
+                client.get.side_effect = [error, ok]
+
+                with patch.object(mu, "time"):
+                    self.assertIs(mu._api_request(client, "get", "https://example.invalid"), ok)
+                self.assertEqual(client.get.call_count, 2)
+
+    def test_a_request_that_cannot_work_is_not_retried(self):
+        """Sending it again cannot change the answer, so it is not sent again."""
+        client = MagicMock()
+        client.get.side_effect = httpx.UnsupportedProtocol("no such scheme")
+
+        with patch.object(mu, "time") as mock_time, self.assertRaises(httpx.UnsupportedProtocol):
+            mu._api_request(client, "get", "https://example.invalid")
+
+        self.assertEqual(client.get.call_count, 1)
+        mock_time.sleep.assert_not_called()
+
+    def test_a_retry_after_beyond_the_limit_fails_at_once(self):
+        """Retry-After was honoured without a limit: 86400 slept every worker
+        for a day, and Ctrl+C could not end the program, because the
+        interpreter waits for sleeping pool threads before it exits."""
+        client = MagicMock()
+        client.get.return_value = self._fake_response(429, {"Retry-After": "86400"})
+
+        with patch.object(mu, "time") as mock_time, self.assertRaises(httpx.HTTPStatusError):
+            mu._api_request(client, "get", "https://example.invalid")
+
+        self.assertEqual(client.get.call_count, 1)
+        mock_time.sleep.assert_not_called()
+
+    def test_a_retry_after_at_the_limit_is_still_honoured(self):
+        rate_limited = self._fake_response(429, {"Retry-After": str(mu.MAX_RETRY_AFTER)})
+        ok = self._fake_response(200)
+        client = MagicMock()
+        client.get.side_effect = [rate_limited, ok]
+
+        with patch.object(mu, "time") as mock_time:
+            self.assertIs(mu._api_request(client, "get", "https://example.invalid"), ok)
+
+        self._assert_delay_in_band(mock_time.sleep.call_args[0][0], float(mu.MAX_RETRY_AFTER), "at the limit")
+
+    def test_a_non_finite_retry_after_falls_back_to_configured_delay(self):
+        """float() accepts "inf" and "nan"; time.sleep(nan) raised from inside
+        the retry handler."""
+        for raw in ("inf", "nan", "-inf"):
+            with self.subTest(raw):
+                resp = self._fake_response(429, {"Retry-After": raw})
+                self._assert_delay_in_band(mu._retry_delay(resp), mu.RETRY_DELAY, f"Retry-After: {raw}")
 
 
 # ==================== reproducible output ====================
@@ -596,6 +681,131 @@ class TestCompareExportsReporting(TempExportsCase):
         with _LogCapture() as cap:
             self.assertFalse(mu.compare_exports(folder, exports))
         self.assertIn("NO CHANGES", cap.text)
+
+    def test_a_series_that_left_a_removed_list_is_reported_as_moved(self):
+        """Only the lists still present were read from the previous export,
+        so a series that moved out of a list that is now gone came back as
+        newly Added."""
+        self._previous({"Gone": [_rec(1, "A")], "Read": [_rec(2, "B")]})
+        now = {"Read": [_rec(1, "A"), _rec(2, "B")]}
+        folder = mu.save_exports(now)
+        with _LogCapture() as cap:
+            mu.compare_exports(folder, now)
+        text = mu._strip_ansi(cap.text)
+        self.assertIn("Moved series", text)
+        self.assertRegex(text, r"A\s+Gone → Read")
+        self.assertNotIn("Added:", text)
+
+    def test_a_removed_list_names_the_series_that_went_with_it(self):
+        self._previous({"Gone": [_rec(1, "Moved On"), _rec(3, "Dropped")], "Read": []})
+        now = {"Read": [_rec(1, "Moved On")]}
+        folder = mu.save_exports(now)
+        with _LogCapture() as cap:
+            mu.compare_exports(folder, now)
+        text = mu._strip_ansi(cap.text)
+        self.assertIn("[Gone] LIST REMOVED (no longer exists) – 2 item(s)", text)
+        self.assertIn("Removed: Dropped", text)
+        self.assertNotIn("Removed: Moved On", text, "a moved series is a move, not a removal")
+
+
+class TestListIdentity(TempExportsCase):
+    """Lists are followed by their MangaUpdates list_id, not their key."""
+
+    def _scan(self, lists):
+        client = _MenuApi([{"list_id": lid, "title": t} for lid, t, _ in lists], {lid: it for lid, _, it in lists})
+        with contextlib.redirect_stdout(io.StringIO()), _LogCapture() as cap:
+            mu.run_scan_lists(client)
+        return mu._strip_ansi(cap.text)
+
+    def test_deleting_one_of_two_same_titled_lists_does_not_scramble_the_other(self):
+        """Reproduced before this fix: list 20 inherited the bare key
+        "Reading" and was diffed against deleted list 10's file -- "Added: C,
+        D / Removed: A, B" for a list that had not changed at all."""
+        self._scan([(10, "Reading", [_rec(1, "A"), _rec(2, "B")]), (20, "Reading", [_rec(3, "C"), _rec(4, "D")])])
+        text = self._scan([(20, "Reading", [_rec(3, "C"), _rec(4, "D")])])
+
+        self.assertNotIn("Added:", text)
+        self.assertIn("[Reading] No changes", text)
+        self.assertIn("[Reading (list_id 10)] LIST REMOVED", text)
+        self.assertIn("Removed: A", text)
+        self.assertIn("Removed: B", text)
+
+    def test_a_case_only_rename_is_one_renamed_list(self):
+        """Reproduced before this fix: NTFS found the old file under the new
+        name, so the same list was reported "No changes" and "LIST REMOVED"."""
+        self._scan([(10, "Sci-fi", [_rec(1, "A")]), (20, "Read", [_rec(2, "B")])])
+        text = self._scan([(10, "Sci-Fi", [_rec(1, "A")]), (20, "Read", [_rec(2, "B")])])
+
+        self.assertIn("[Sci-Fi] renamed (was 'Sci-fi')", text)
+        self.assertNotIn("LIST REMOVED", text)
+        self.assertNotIn("NEW LIST", text)
+
+    def test_a_move_out_of_a_deleted_same_titled_list_is_a_named_move(self):
+        """The removed list and the survivor share the key "Reading", so a
+        comparison by name saw no move at all; it is named by its id."""
+        self._scan([(10, "Reading", [_rec(1, "A")]), (20, "Reading", [_rec(2, "B")])])
+        text = self._scan([(20, "Reading", [_rec(1, "A"), _rec(2, "B")])])
+
+        self.assertIn("Moved series", text)
+        self.assertRegex(text, r"A\s+Reading \(list_id 10\) → Reading")
+        self.assertNotIn("Added:", text)
+
+    def test_a_shifted_duplicate_suffix_is_not_a_rename(self):
+        self._scan([(10, "Reading", [_rec(1, "A")]), (20, "Reading", [_rec(2, "B")])])
+        text = self._scan([(20, "Reading", [_rec(2, "B")])])
+        self.assertNotIn("renamed", text)
+
+    def test_the_manifest_records_each_lists_id_and_title(self):
+        self._scan([(10, "Reading", [_rec(1, "A")]), (20, "Reading", [_rec(2, "B")])])
+        folder = os.path.join(self.dir.name, next(d for d in os.listdir(self.dir.name) if mu._is_export_folder(d)))
+        manifest = mu._read_manifest(folder)
+        assert manifest is not None
+        self.assertEqual(manifest["Reading"].list_id, 10)
+        self.assertEqual(manifest["Reading (2)"], mu._ManifestEntry("Reading (2)", 20, "Reading"))
+
+    def _write_old_style_previous(self, manifest: dict, files: dict) -> None:
+        prev = os.path.join(self.dir.name, "01.01.2026_00-00-00")
+        os.makedirs(prev)
+        with open(os.path.join(prev, mu.MANIFEST_NAME), "w", encoding="utf-8") as f:
+            json.dump(manifest, f)
+        for name, items in files.items():
+            with open(os.path.join(prev, f"{name}.json"), "w", encoding="utf-8") as f:
+                json.dump(items, f)
+
+    def test_an_export_from_before_ids_were_recorded_still_diffs_by_title(self):
+        """Existing exports carry a title -> filename manifest with no ids;
+        an unknown id is matched by title, not treated as a different list."""
+        self._write_old_style_previous({"Reading": "Reading"}, {"Reading": [_rec(1, "A")]})
+        text = self._scan([(10, "Reading", [_rec(1, "A"), _rec(2, "B")])])
+
+        self.assertIn("Added:   B", text)
+        self.assertNotIn("NEW LIST", text)
+        self.assertNotIn("LIST REMOVED", text)
+
+    def test_without_ids_a_title_missing_from_the_manifest_is_a_new_list_not_a_guessed_file(self):
+        """A title the previous manifest does not list used to be looked up by
+        sanitize_filename() -- which on NTFS found a different list's file."""
+        self._write_old_style_previous({"Sci-fi": "Sci-fi"}, {"Sci-fi": [_rec(1, "A")]})
+        text = self._scan([(10, "Sci-Fi", [_rec(1, "A")])])
+
+        self.assertIn("[Sci-Fi] NEW LIST", text)
+        self.assertIn("[Sci-fi] LIST REMOVED", text)
+        self.assertRegex(text, r"A\s+Sci-fi → Sci-Fi")
+        self.assertNotIn("No changes", text)
+
+    def test_two_different_ids_under_one_key_are_two_lists(self):
+        self._scan([(10, "Reading", [_rec(1, "A")])])
+        text = self._scan([(20, "Reading", [_rec(2, "B")])])
+        self.assertIn("[Reading] NEW LIST", text)
+        self.assertIn("[Reading (list_id 10)] LIST REMOVED", text)
+
+    def test_a_manifest_entry_of_an_unknown_shape_falls_back_to_the_files(self):
+        folder = os.path.join(self.dir.name, "folder")
+        os.makedirs(folder)
+        with open(os.path.join(folder, mu.MANIFEST_NAME), "w", encoding="utf-8") as f:
+            json.dump({"Reading": 5}, f)
+        self.assertIsNone(mu._read_manifest(folder))
+        self.assertEqual(mu.load_manifest(folder, ["Reading"]), {"Reading": "Reading"})
 
 
 # ==================== error paths ====================
@@ -1167,6 +1377,89 @@ class TestMenuSurvivesAFailingOption(unittest.TestCase):
             bye.assert_called_once()
 
 
+def _status_error(code: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", "https://api.mangaupdates.com/v1/lists")
+    return httpx.HTTPStatusError(f"HTTP {code}", request=request, response=httpx.Response(code, request=request))
+
+
+class TestExpiredSession(unittest.TestCase):
+    """The token from login() was used for the whole session, so once it
+    lapsed every option failed -- each with "You are still logged in" under
+    it -- until the program was restarted."""
+
+    def _run_menu(self, action, keys=("1", "0")):
+        out = io.StringIO()
+        with (
+            patch.object(mu, "check_site_reachable", return_value=True),
+            patch.object(mu, "login", side_effect=["tok", "fresh", "fresher"]) as login,
+            patch.object(mu, "logout"),
+            patch.object(mu, "run_scan_lists", action),
+            patch("httpx.Client", return_value=MagicMock()),
+            patch("builtins.input", side_effect=list(keys)),
+            contextlib.redirect_stdout(out),
+            _LogCapture(),
+        ):
+            mu.main()
+        return login.call_count, out.getvalue()
+
+    def test_a_401_logs_in_again_and_runs_the_option_once_more(self):
+        calls = []
+
+        def expires_once(_client):
+            calls.append(1)
+            if len(calls) == 1:
+                raise _status_error(401)
+
+        logins, out = self._run_menu(expires_once)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(logins, 2, "one login at start, one after the 401")
+        self.assertNotIn("did not finish", out)
+
+    def test_a_second_401_is_reported_and_not_retried_again(self):
+        calls = []
+
+        def always_rejected(_client):
+            calls.append(1)
+            raise _status_error(401)
+
+        logins, out = self._run_menu(always_rejected)
+        self.assertEqual((len(calls), logins), (2, 2))
+        self.assertIn("rejected the session even after logging in again", out)
+        self.assertNotIn("You are still logged in", out)
+
+    def test_other_failures_are_not_retried(self):
+        calls = []
+
+        def server_error(_client):
+            calls.append(1)
+            raise _status_error(500)
+
+        logins, out = self._run_menu(server_error)
+        self.assertEqual((len(calls), logins), (1, 1))
+        self.assertIn("You are still logged in", out)
+
+
+class TestMenuPrompt(unittest.TestCase):
+    def test_a_run_of_unusable_answers_quits_instead_of_asking_forever(self):
+        """The menu asked again on every unusable answer without limit, so an
+        unattended feed of junk kept it asking forever. After
+        MAX_UNRECOGNIZED it gives the answer that changes nothing: 0."""
+        ran = []
+        with (
+            patch.object(mu, "check_site_reachable", return_value=True),
+            patch.object(mu, "login", return_value="tok"),
+            patch.object(mu, "logout") as bye,
+            patch.object(mu, "run_scan_lists", lambda _c: ran.append("1")),
+            patch("httpx.Client", return_value=MagicMock()),
+            patch("builtins.input", side_effect=["x"] * mu.term.MAX_UNRECOGNIZED),
+            contextlib.redirect_stdout(io.StringIO()) as out,
+        ):
+            mu.main()
+        self.assertEqual(ran, [])
+        bye.assert_called_once()
+        self.assertIn("type a number between 0 and 4", out.getvalue())
+
+
 # ==================== export folder handling ====================
 class _MenuApi:
     """Minimal stand-in for the API client used by the run_* entry points."""
@@ -1226,7 +1519,7 @@ class TestUnreadablePreviousExport(TempExportsCase):
 
     def test_load_prev_exports_reports_it_as_unreadable_not_as_empty(self):
         prev = self._write_corrupt_previous()
-        loaded, unreadable = mu._load_prev_exports(prev, ["Reading List"])
+        loaded, unreadable = mu._load_prev_exports(prev, mu.load_manifest(prev, ["Reading List"]))
         self.assertEqual(unreadable, {"Reading List"})
         self.assertNotIn("Reading List", loaded, "an unreadable file must not masquerade as an empty list")
 
@@ -1663,14 +1956,18 @@ AP_PROFILE_HTML = """
 
 
 class TestAnimePlanetProfileParsing(unittest.TestCase):
-    def test_only_non_empty_lists_are_returned(self):
+    def test_every_list_is_returned_including_empty_ones(self):
+        """Empty lists used to be dropped here, so a list emptied since the
+        last run vanished from the export and was reported as removed."""
         infos = mu._ap_parse_profile_list_counts(AP_PROFILE_HTML)
         keys = [key for key, _href, _label, _count in infos]
         self.assertEqual(
             keys,
-            ["manga/reading", "manga/wanttoread", "manga/stalled", "anime/watched"],
-            "the count-0 list must be skipped, and both sections must be read",
+            ["manga/read", "manga/reading", "manga/wanttoread", "manga/stalled", "anime/watched"],
+            "the count-0 list must be kept, and both sections must be read",
         )
+        counts = {key: count for key, _href, _label, count in infos}
+        self.assertEqual(counts["manga/read"], 0)
 
     def test_counts_are_returned_as_integers(self):
         infos = mu._ap_parse_profile_list_counts(AP_PROFILE_HTML)
@@ -1715,25 +2012,42 @@ class TestAnimePlanetProfileParsing(unittest.TestCase):
         self.assertEqual(label, "Manga New List Kind")
         self.assertEqual(count, 4)
 
-    def test_malformed_items_are_skipped_not_fatal(self):
+    def test_an_unreadable_list_entry_stops_the_parse_instead_of_being_skipped(self):
+        """Each of these used to be skipped without a word, so that list was
+        left out of the export and the next comparison reported it, and every
+        title in it, as removed. It must stop the run instead -- the same rule
+        fetch_lists applies to a malformed MangaUpdates list index."""
+        good = (
+            '<li class="status4"><a href="/users/nawid3333/manga/dropped">'
+            '<span class="slCount">1</span><span class="slLabel">dropped</span></a></li>'
+        )
+        broken = {
+            "unreadable count": '<li class="status1"><a href="/users/nawid3333/manga/read">'
+            '<span class="slCount">nope</span><span class="slLabel">read</span></a></li>',
+            "no count": '<li class="status2"><a href="/users/nawid3333/manga/reading">'
+            '<span class="slLabel">no count</span></a></li>',
+            "no link": '<li class="status3"><span class="slCount">9</span></li>',
+            "empty link": '<li class="status3"><a href=""><span class="slCount">9</span></a></li>',
+        }
+        for name, item in broken.items():
+            with self.subTest(name), self.assertRaises(ValueError) as caught:
+                mu._ap_parse_profile_list_counts(f'<ul class="statList">{item}{good}</ul>')
+            self.assertIn("Nothing was saved", str(caught.exception))
+
+    def test_a_missing_label_span_does_not_matter(self):
+        """The label comes from AP_LIST_TYPES or the URL, never the page, so a
+        list whose label span is gone is still read rather than dropped."""
         html = """
         <ul class="statList">
-          <li class="status1">
-            <a href="/users/nawid3333/manga/read"><span class="slCount">nope</span><span class="slLabel">read</span></a>
-          </li>
-          <li class="status2"><a href="/users/nawid3333/manga/reading"><span class="slLabel">no count</span></a></li>
-          <li class="status3"><span class="slCount">9</span></li>
-          <li class="status4">
-            <a href="/users/nawid3333/manga/dropped">
-              <span class="slCount">1</span><span class="slLabel">dropped</span>
-            </a>
-          </li>
+          <li class="status1"><a href="/users/nawid3333/manga/read"><span class="slCount">4</span></a></li>
         </ul>
         """
-        infos = mu._ap_parse_profile_list_counts(html)
-        self.assertEqual([key for key, _h, _l, _c in infos], ["manga/dropped"])
+        self.assertEqual(
+            mu._ap_parse_profile_list_counts(html),
+            [("manga/read", "/users/nawid3333/manga/read", "Read", 4)],
+        )
 
-    def test_an_item_with_a_zero_count_is_not_reported_as_an_error(self):
+    def test_an_item_with_a_zero_count_is_kept_as_an_empty_list(self):
         html = """
         <ul class="statList">
           <li class="status1">
@@ -1741,7 +2055,10 @@ class TestAnimePlanetProfileParsing(unittest.TestCase):
           </li>
         </ul>
         """
-        self.assertEqual(mu._ap_parse_profile_list_counts(html), [])
+        self.assertEqual(
+            mu._ap_parse_profile_list_counts(html),
+            [("manga/read", "/users/nawid3333/manga/read", "Read", 0)],
+        )
 
     def test_empty_or_unrecognisable_pages_yield_no_lists(self):
         self.assertEqual(mu._ap_parse_profile_list_counts(""), [])
@@ -1876,6 +2193,29 @@ class _ApFakeClient:
         status = 200 if page in pages else 404
         return _FakeApApiResponse(status, pages.get(page, ""))
 
+    def close(self) -> None:
+        pass
+
+
+def _ap_page(*cards: str) -> str:
+    return f'<ul class="cardDeck cardGrid">{"".join(cards)}</ul>'
+
+
+def _ap_cards(first_id: int, count: int, data_type: str = "manga") -> list[str]:
+    return [
+        _ap_card(i, f"Title {i}", f"/{data_type}/t{i}", data_type=data_type) for i in range(first_id, first_id + count)
+    ]
+
+
+def _small_ap_pages():
+    """Let pages of a card or two stand for a real page in the paging tests.
+
+    _ap_fetch_all_list_entries only trusts page 1's length as the site's page
+    size when it is at least the site's own default (35); below that it reads
+    as a broken page. Lowering that floor keeps the paging tests small.
+    """
+    return patch.object(mu, "_AP_SITE_PER_PAGE", 1)
+
 
 def _as_ap_client(fake) -> mu._AnimePlanetClient:
     """Hand a scripted fake to code annotated with the real client class."""
@@ -1903,19 +2243,75 @@ class TestAnimePlanetFetchAllListEntries(unittest.TestCase):
         }
         client = _ApFakeClient(spec)
 
-        # 561 reported items span two 560-per-page pages.
-        entries = mu._ap_fetch_all_list_entries(_as_ap_client(client), "u", "manga/reading", 561)
+        # Four reported items at two per page span two pages.
+        with _small_ap_pages():
+            entries = mu._ap_fetch_all_list_entries(_as_ap_client(client), "u", "manga/reading", 4)
 
         self.assertEqual([e["record"]["series"]["id"] for e in entries], [1, 2, 3, 4])
 
     def test_every_page_is_fetched_when_the_count_spans_pages(self):
-        html = '<ul class="cardDeck cardGrid"></ul>'
-        client = _ApFakeClient({"manga/reading": dict.fromkeys((1, 2, 3), html)})
+        spec = {
+            "manga/reading": {
+                1: _ap_page(*_ap_cards(1, 2)),
+                2: _ap_page(*_ap_cards(3, 2)),
+                3: _ap_page(*_ap_cards(5, 1)),
+            }
+        }
+        client = _ApFakeClient(spec)
 
-        entries = mu._ap_fetch_all_list_entries(_as_ap_client(client), "u", "manga/reading", 1201)
+        with _small_ap_pages():
+            entries = mu._ap_fetch_all_list_entries(_as_ap_client(client), "u", "manga/reading", 5)
 
-        self.assertEqual(mu.get_series_ids(entries), {})
+        self.assertEqual(len(entries), 5)
         self.assertEqual(sorted(client.calls), [("manga/reading", 1), ("manga/reading", 2), ("manga/reading", 3)])
+
+    def test_pages_are_sized_from_what_the_site_actually_serves(self):
+        """The page count used to come from the 560 asked for. A site serving
+        its own default of 35 left everything past page 1 out, and the short
+        list was saved -- the next diff reported the rest as removed."""
+        cards = _ap_cards(1, 80)
+        spec = {"manga/reading": {1: _ap_page(*cards[:35]), 2: _ap_page(*cards[35:70]), 3: _ap_page(*cards[70:])}}
+        client = _ApFakeClient(spec)
+
+        entries = mu._ap_fetch_all_list_entries(_as_ap_client(client), "u", "manga/reading", 80)
+
+        self.assertEqual(len(entries), 80)
+        self.assertEqual(sorted(page for _lt, page in client.calls), [1, 2, 3])
+
+    def test_a_short_list_is_never_returned_as_complete(self):
+        """The profile says 3, the page holds 1: this used to log a warning
+        and save the short list, and the next run reported two removals."""
+        client = _ApFakeClient({"manga/reading": {1: _ap_page(*_ap_cards(1, 1))}})
+
+        with self.assertRaises(ValueError) as caught:
+            mu._ap_fetch_all_list_entries(_as_ap_client(client), "u", "manga/reading", 3, "Reading")
+
+        message = str(caught.exception)
+        self.assertIn("incomplete", message.lower())
+        self.assertIn("'Reading'", message)
+        self.assertIn("1 of 3", message)
+
+    def test_a_page_that_parses_to_nothing_is_not_paged_through(self):
+        """A bot-check or private-list page answers 200 with no cards. It is
+        not a page size to plan from, so nothing more is fetched before the
+        run stops."""
+        client = _ApFakeClient({"manga/reading": {1: "<html><body>Just a moment...</body></html>"}})
+
+        with self.assertRaises(ValueError):
+            mu._ap_fetch_all_list_entries(_as_ap_client(client), "u", "manga/reading", 1201)
+
+        self.assertEqual(client.calls, [("manga/reading", 1)])
+
+    def test_a_repeated_page_does_not_count_twice(self):
+        """A page past the real end can come back as a copy of page 1; its
+        cards must not make a short list add up to the profile's count."""
+        page = _ap_page(*_ap_cards(1, 2))
+        client = _ApFakeClient({"manga/reading": {1: page, 2: page}})
+
+        with _small_ap_pages(), self.assertRaises(ValueError) as caught:
+            mu._ap_fetch_all_list_entries(_as_ap_client(client), "u", "manga/reading", 4)
+
+        self.assertIn("2 of 4", str(caught.exception))
 
     def test_pages_are_fetched_in_parallel_not_one_after_another(self):
         """The two-page fetch must actually use its worker pool; with the
@@ -1934,17 +2330,14 @@ class TestAnimePlanetFetchAllListEntries(unittest.TestCase):
                     intervals.append((start, _time.perf_counter()))
                 return super().get(path, params)
 
-        spec = {
-            "manga/reading": {
-                1: f'<ul class="cardDeck cardGrid">{_ap_card(1, "P1A", "/manga/p1a")}</ul>',
-                2: f'<ul class="cardDeck cardGrid">{_ap_card(2, "P2A", "/manga/p2a")}</ul>',
-            }
-        }
+        # Page 1 goes alone -- its length is the page size -- so the overlap
+        # to look for is among the pages after it.
+        spec = {"manga/reading": {page: _ap_page(*_ap_cards(page, 1)) for page in (1, 2, 3)}}
 
-        with patch.object(mu, "LIST_PAGE_WORKERS", 4):
-            mu._ap_fetch_all_list_entries(_as_ap_client(TimedPage(spec)), "u", "manga/reading", 561)
+        with patch.object(mu, "LIST_PAGE_WORKERS", 4), _small_ap_pages():
+            mu._ap_fetch_all_list_entries(_as_ap_client(TimedPage(spec)), "u", "manga/reading", 3)
 
-        self.assertGreaterEqual(_peak_overlap(intervals), 2, "page 2 was fetched one after another")
+        self.assertGreaterEqual(_peak_overlap(intervals), 2, "pages 2 and 3 were fetched one after another")
 
     def test_a_failing_page_aborts_rather_than_exporting_a_short_list(self):
         class BrokenPage(_ApFakeClient):
@@ -1953,11 +2346,10 @@ class TestAnimePlanetFetchAllListEntries(unittest.TestCase):
                 resp.raise_for_status()
                 return resp
 
-        spec = {"manga/reading": {1: '<ul class="cardDeck cardGrid"></ul>', 2: '<ul class="cardDeck cardGrid"></ul>'}}
-        client = BrokenPage({"manga/reading": {1: spec["manga/reading"][1]}})  # page 2 -> 404
+        client = BrokenPage({"manga/reading": {1: _ap_page(*_ap_cards(1, 2))}})  # pages 2 and 3 -> 404
 
-        with self.assertRaises(httpx.HTTPStatusError):
-            mu._ap_fetch_all_list_entries(_as_ap_client(client), "u", "manga/reading", 1201)
+        with _small_ap_pages(), self.assertRaises(httpx.HTTPStatusError):
+            mu._ap_fetch_all_list_entries(_as_ap_client(client), "u", "manga/reading", 6)
 
     def test_zero_and_negative_counts_fetch_nothing(self):
         client = _ApFakeClient({})
@@ -2038,6 +2430,143 @@ class TestAnimePlanetExportAllLists(unittest.TestCase):
         rather than relying on the dedup guard to paper over it."""
         labels = list(mu.AP_LIST_TYPES.values())
         self.assertEqual(len(labels), len(set(labels)), f"duplicate labels in AP_LIST_TYPES: {labels}")
+
+
+# Option 4 is handed the MangaUpdates client like every option, and never
+# touches it.
+_NO_MU_CLIENT = cast(mu._ClientLike, None)
+
+
+def _ap_profile(**counts: int) -> str:
+    """A profile statList with one entry per list type, e.g. manga_reading=2."""
+    items = "".join(
+        f'<li class="status"><a href="/users/u/{key.replace("_", "/", 1)}">'
+        f'<span class="slCount">{count}</span><span class="slLabel">x</span></a></li>'
+        for key, count in counts.items()
+    )
+    return f'<ul class="statList">{items}</ul>'
+
+
+class TestAnimePlanetScan(TempExportsCase):
+    """Option 4 end to end, against a scripted Anime-Planet and a temp tree."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.ap_dir = os.path.join(self.dir.name, "anime-planet")
+        for name, value in (("AP_EXPORTS_DIR", self.ap_dir), ("AP_USERNAME", "u")):
+            patcher = patch.object(mu, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _scan(self, spec):
+        with patch.object(mu, "_AnimePlanetClient", lambda: _ApFakeClient(spec)), _LogCapture() as cap:
+            mu.run_anime_planet_scan(_NO_MU_CLIENT)
+        return mu._strip_ansi(cap.text)
+
+    def _folders(self):
+        return sorted(d for d in os.listdir(self.ap_dir) if mu._is_export_folder(d))
+
+    def test_a_short_list_stops_the_run_and_keeps_the_previous_export(self):
+        """Reproduced before this fix: the profile said 3, the list page held
+        1, and the run saved it with a warning -- then reported "Removed: B"
+        and "Removed: C" for titles still on the account."""
+        self._scan({"": {1: _ap_profile(manga_reading=3)}, "manga/reading": {1: _ap_page(*_ap_cards(1, 3))}})
+        before = self._folders()
+        with open(os.path.join(self.ap_dir, before[0], "Reading.json"), encoding="utf-8") as f:
+            saved = f.read()
+
+        with self.assertRaises(ValueError) as caught:
+            self._scan({"": {1: _ap_profile(manga_reading=3)}, "manga/reading": {1: _ap_page(*_ap_cards(1, 1))}})
+
+        self.assertIn("1 of 3", str(caught.exception))
+        self.assertEqual(self._folders(), before, "a short export was saved")
+        with open(os.path.join(self.ap_dir, before[0], "Reading.json"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), saved, "the previous export was touched")
+
+    def test_a_list_emptied_since_the_last_run_reads_as_a_move(self):
+        """Reproduced before this fix: Alpha finished, Reading went to 0, and
+        the diff said "[Read] + Added: Alpha" and "[Reading] LIST REMOVED (no
+        longer exists)" -- the list exists, and nothing was added."""
+        self._scan(
+            {
+                "": {1: _ap_profile(manga_reading=1, manga_read=1)},
+                "manga/reading": {1: _ap_page(_ap_card(1, "Alpha"))},
+                "manga/read": {1: _ap_page(_ap_card(2, "Beta"))},
+            }
+        )
+        text = self._scan(
+            {
+                "": {1: _ap_profile(manga_reading=0, manga_read=2)},
+                "manga/read": {1: _ap_page(_ap_card(1, "Alpha"), _ap_card(2, "Beta"))},
+            }
+        )
+
+        self.assertIn("Moved series", text)
+        self.assertRegex(text, r"Alpha\s+Reading → Read")
+        self.assertNotIn("Added:", text)
+        self.assertNotIn("LIST REMOVED", text)
+
+    def test_a_profile_with_every_list_at_zero_saves_nothing(self):
+        """All zeros is far likelier a page that did not show the counts than
+        an account emptied overnight; saving it would report every title as
+        removed."""
+        text = self._scan({"": {1: _ap_profile(manga_reading=0, manga_read=0)}})
+        self.assertIn("No non-empty Anime-Planet lists", text)
+        self.assertFalse(os.path.isdir(self.ap_dir) and self._folders())
+
+    def test_an_unknown_user_is_named_not_reported_as_unreachable(self):
+        with self.assertRaises(ValueError) as caught:
+            self._scan({})  # the profile answers 404
+        self.assertIn("AP_USERNAME", str(caught.exception))
+
+    def test_a_refused_request_is_not_called_unreachable(self):
+        class Forbidden(_ApFakeClient):
+            def get(self, path, params=None):  # noqa: ARG002
+                return _FakeApApiResponse(403, "")
+
+        with patch.object(mu, "_AnimePlanetClient", lambda: Forbidden({})), _LogCapture() as cap:
+            mu.run_anime_planet_scan(_NO_MU_CLIENT)
+        self.assertIn("answered HTTP 403", cap.text)
+        self.assertNotIn("Could not reach", cap.text)
+
+
+class TestAnimePlanetClientRetries(unittest.TestCase):
+    """Anime-Planet requests went out bare: one 429, or one dropped
+    connection among up to LIST_PAGE_WORKERS pages in flight, ended option 4."""
+
+    def _client(self, handler) -> mu._AnimePlanetClient:
+        ap = mu._AnimePlanetClient()
+        ap.client.close()
+        ap.client = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True)
+        self.addCleanup(ap.close)
+        return ap
+
+    def test_a_rate_limited_page_is_retried(self):
+        answers = [httpx.Response(429, headers={"Retry-After": "0"}), httpx.Response(200, text="ok")]
+        sent = []
+
+        def handler(request):
+            sent.append(request.url.path)
+            return answers.pop(0)
+
+        with patch.object(mu, "time"):
+            resp = self._client(handler).get("/users/u/manga/read")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(sent, ["/users/u/manga/read", "/users/u/manga/read"])
+
+    def test_a_dropped_connection_is_retried(self):
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            if len(calls) == 1:
+                raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+            return httpx.Response(200, text="ok")
+
+        with patch.object(mu, "time"):
+            self.assertEqual(self._client(handler).get("/users/u").status_code, 200)
+        self.assertEqual(len(calls), 2)
 
 
 class TestAnimePlanetPagesNeeded(unittest.TestCase):
@@ -2122,7 +2651,7 @@ class TestCollectRelatedSeries(unittest.TestCase):
         }
         client = _FakeSeriesClient({1: ONE_PIECE_RELATIONS, 14853239448: [], 3: "404"})
 
-        related = mu.collect_related_series(client, exports)
+        related = mu.collect_related_series(client, exports).found
 
         self.assertIn(49512032547, related, "One Piece Party is new and must be found")
         self.assertEqual(related[49512032547]["title"], "One Piece Party")
@@ -2133,7 +2662,7 @@ class TestCollectRelatedSeries(unittest.TestCase):
         exports = {"Reading": [_rec(1, "One Piece"), _rec(3, "Deleted Series")]}
         client = _FakeSeriesClient({1: [], 3: "404"})
 
-        related = mu.collect_related_series(client, exports)
+        related = mu.collect_related_series(client, exports).found
 
         self.assertEqual(related, {})
         self.assertEqual(sorted(client.calls), [1, 3], "the 404 must not abort the whole pass")
@@ -2151,7 +2680,7 @@ class TestCollectRelatedSeries(unittest.TestCase):
         ]
         client = _FakeSeriesClient({1: self_relation})
 
-        related = mu.collect_related_series(client, exports)
+        related = mu.collect_related_series(client, exports).found
 
         self.assertEqual(related, {})
 
@@ -2169,7 +2698,7 @@ class TestCollectRelatedSeries(unittest.TestCase):
             }
         )
 
-        related = mu.collect_related_series(client, exports)
+        related = mu.collect_related_series(client, exports).found
 
         self.assertEqual(len(related), 1, "must be deduplicated into a single entry")
         self.assertEqual(set(related[99]["sources"]), {("Series A", "Prequel"), ("Series B", "Sequel")})
@@ -2180,7 +2709,7 @@ class TestCollectRelatedSeries(unittest.TestCase):
             {1: [{"relation_id": 1, "relation_type": "Spin-Off"}]}  # missing id and name
         )
 
-        related = mu.collect_related_series(client, exports)
+        related = mu.collect_related_series(client, exports).found
 
         self.assertEqual(related, {})
 
@@ -2217,7 +2746,7 @@ class TestCollectRelatedSeries(unittest.TestCase):
         }
         client = ShapeShiftingClient()
 
-        related = mu.collect_related_series(client, exports)  # must not raise
+        related = mu.collect_related_series(client, exports).found  # must not raise
 
         self.assertEqual(related, {})
         self.assertEqual(sorted(client.calls), [1, 2, 999], "the bad-shape series must not abort the others")
@@ -2382,7 +2911,7 @@ class TestFindFinishedWishlistSeries(unittest.TestCase):
             }
         )
 
-        finished = mu.find_finished_wishlist_series(client, wish_items)
+        finished = mu.find_finished_wishlist_series(client, wish_items).found
 
         self.assertEqual(set(finished), {1})
         self.assertEqual(finished[1]["title"], "Finished Manga")
@@ -2395,7 +2924,7 @@ class TestFindFinishedWishlistSeries(unittest.TestCase):
         wish_items = [_rec_url(1, "Cancelled Manga")]
         client = _FakeStatusClient({1: {"completed": True, "status": "4 Volumes (Complete/Discontinued)"}})
 
-        finished = mu.find_finished_wishlist_series(client, wish_items)
+        finished = mu.find_finished_wishlist_series(client, wish_items).found
 
         self.assertEqual(set(finished), {1})
 
@@ -2423,7 +2952,7 @@ class TestFindFinishedWishlistSeries(unittest.TestCase):
         wish_items = [_rec_url(1, "Good 1"), _rec_url(999, "Bad Shape"), _rec_url(2, "Good 2")]
         client = ShapeShiftingClient()
 
-        finished = mu.find_finished_wishlist_series(client, wish_items)  # must not raise
+        finished = mu.find_finished_wishlist_series(client, wish_items).found  # must not raise
 
         self.assertEqual(set(finished), {1, 2})
         self.assertEqual(sorted(client.calls), [1, 2, 999])
@@ -2436,7 +2965,7 @@ class TestFindFinishedWishlistSeries(unittest.TestCase):
             {1: {"completed": False, "status": "27 Volumes (Complete)\n\n42 Chapters (Webtoon, Ongoing)"}}
         )
 
-        finished = mu.find_finished_wishlist_series(client, wish_items)
+        finished = mu.find_finished_wishlist_series(client, wish_items).found
 
         self.assertEqual(finished, {})
 
@@ -2444,13 +2973,13 @@ class TestFindFinishedWishlistSeries(unittest.TestCase):
         wish_items = [_rec_url(1, "Deleted Series")]
         client = _FakeStatusClient({1: "404"})
 
-        finished = mu.find_finished_wishlist_series(client, wish_items)
+        finished = mu.find_finished_wishlist_series(client, wish_items).found
 
         self.assertEqual(finished, {})
         self.assertEqual(client.calls, [1], "the 404 must not abort the whole pass")
 
     def test_empty_wishlist_produces_no_lookups(self):
-        finished = mu.find_finished_wishlist_series(_FakeStatusClient({}), [])
+        finished = mu.find_finished_wishlist_series(_FakeStatusClient({}), []).found
         self.assertEqual(finished, {})
 
 
@@ -2504,6 +3033,140 @@ class TestSaveFinishedSeries(TempExportsCase):
         self.assertIn("https://www.mangaupdates.com/series/x/rosario-to-vampire", content)
         self.assertIn("1 series finished out of 7 checked", content)
         self.assertIn("[1/1]", content)
+
+
+# ==================== lookups that came back with no answer ====================
+class _Script:
+    """Hand out *answers* one per prompt and record every prompt shown.
+
+    Running out is a failure, not an end of input: a prompt that asks more
+    often than the test expects is exactly what these tests are here to see.
+    An answer that is an exception instance is raised instead (EOFError).
+    """
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.asked: list[str] = []
+
+    def __call__(self, prompt=""):
+        self.asked.append(prompt)
+        if not self.answers:
+            raise AssertionError(f"asked again after the scripted answers ran out: {prompt!r}")
+        answer = self.answers.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+
+class TestFailedLookupsAreNotHidden(TempExportsCase):
+    """Reproduced before this fix: with every /series lookup rate-limited,
+    ready_to_read.txt said "0 series finished out of 3 checked -- No Wish
+    List series have finished releasing yet" and related.txt said "every
+    related series found is already in one of your lists", each replacing a
+    good report from an earlier run."""
+
+    GOOD = "a good report from an earlier run\n"
+
+    def _previous(self, name):
+        path = os.path.join(self.dir.name, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(self.GOOD)
+        return path
+
+    def _read(self, path):
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def _wish_list(self, count=3):
+        return _MenuApi([{"list_id": 1, "title": "Wish List"}], {1: [_rec(i, f"S{i}") for i in range(1, count + 1)]})
+
+    def _finished_check(self, status, *answers):
+        """Run option 3 with `status(series_id)` standing in for each lookup."""
+        script = _Script(*answers)
+        with (
+            patch.object(mu, "fetch_series_status", lambda _client, sid: status(sid)),
+            patch("builtins.input", script),
+            contextlib.redirect_stdout(io.StringIO()) as out,
+            _LogCapture() as cap,
+        ):
+            mu.run_finished_check(self._wish_list())
+        return script, mu._strip_ansi(cap.text + out.getvalue())
+
+    @staticmethod
+    def _second_fails(sid):
+        return None if sid == 2 else {"completed": sid == 1, "status": "Complete"}
+
+    def test_failed_lookups_are_counted_not_dropped(self):
+        # 2 no longer exists; 3 answers with a body that is not an object.
+        client = _FakeStatusClient({1: {"completed": True, "status": "(Complete)"}, 2: "404", 3: ["junk"]})
+        lookups = mu.find_finished_wishlist_series(client, [_rec(1, "Done"), _rec(2, "Gone"), _rec(3, "Failed")])
+        self.assertEqual(set(lookups.found), {1})
+        self.assertEqual((lookups.total, lookups.unchecked), (3, 2), "a 404 and a failure are both unchecked")
+
+    def test_related_lookups_count_failures_too(self):
+        client = _FakeSeriesClient({1: [], 2: "404"})
+        lookups = mu.collect_related_series(client, {"Reading": [_rec(1, "A"), _rec(2, "B")]})
+        self.assertEqual((lookups.total, lookups.unchecked), (2, 1))
+
+    def test_the_reports_name_what_could_not_be_checked(self):
+        related = self._read(mu.save_related_series({}, unchecked=2))
+        self.assertIn("2 series could not be checked", related)
+        self.assertNotIn("already in one of your lists", related, "that claim needs every series checked")
+
+        finished = self._read(mu.save_finished_series({}, 1, unchecked=2))
+        self.assertIn("0 series finished out of 1 checked", finished)
+        self.assertIn("2 series could not be checked", finished)
+
+    def test_every_lookup_failing_keeps_the_previous_report_without_asking(self):
+        path = self._previous("related.txt")
+        client = _MenuApi([{"list_id": 1, "title": "Reading"}], {1: [_rec(1, "A"), _rec(2, "B")]})
+        with (
+            patch.object(mu, "fetch_series_related", return_value=None),
+            patch("builtins.input", _Script()),
+            _LogCapture() as cap,
+        ):
+            mu.run_related_check(client)
+        self.assertEqual(self._read(path), self.GOOD)
+        self.assertIn("2 of 2 series could not be checked", cap.text)
+        self.assertIn("keeping the previous report", cap.text)
+
+    def test_some_lookups_failing_asks_and_n_keeps_the_previous_report(self):
+        path = self._previous("ready_to_read.txt")
+        script, text = self._finished_check(self._second_fails, "n")
+        self.assertEqual(len(script.asked), 1)
+        self.assertEqual(self._read(path), self.GOOD)
+        self.assertIn("1 of 3 series could not be checked", text)
+
+    def test_y_replaces_it_with_the_incomplete_report(self):
+        path = self._previous("ready_to_read.txt")
+        self._finished_check(self._second_fails, "Y")
+        report = self._read(path)
+        self.assertIn("1 series finished out of 2 checked", report)
+        self.assertIn("1 series could not be checked", report)
+
+    def test_only_y_or_n_answer_and_end_of_input_keeps_the_previous_report(self):
+        path = self._previous("ready_to_read.txt")
+        script, text = self._finished_check(self._second_fails, "", "yes", "j", EOFError())
+        self.assertEqual(len(script.asked), 4, "Enter and other answers must be asked again")
+        self.assertIn("type y or n", text)
+        self.assertEqual(self._read(path), self.GOOD)
+
+    def test_a_run_of_unusable_answers_keeps_the_previous_report(self):
+        path = self._previous("ready_to_read.txt")
+        script, _text = self._finished_check(self._second_fails, *(["x"] * mu.term.MAX_UNRECOGNIZED))
+        self.assertEqual(len(script.asked), mu.term.MAX_UNRECOGNIZED)
+        self.assertEqual(self._read(path), self.GOOD)
+
+    def test_with_no_previous_report_the_incomplete_one_is_written_without_asking(self):
+        script, _text = self._finished_check(self._second_fails)
+        self.assertEqual(script.asked, [])
+        self.assertIn("1 series could not be checked", self._read(os.path.join(self.dir.name, "ready_to_read.txt")))
+
+    def test_a_complete_run_still_replaces_the_report_without_asking(self):
+        path = self._previous("ready_to_read.txt")
+        script, _text = self._finished_check(lambda sid: {"completed": sid == 1, "status": "Complete"})
+        self.assertEqual(script.asked, [])
+        self.assertIn("1 series finished out of 3 checked", self._read(path))
 
 
 if __name__ == "__main__":

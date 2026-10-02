@@ -1,6 +1,7 @@
 import concurrent.futures
 import contextlib
 import json
+import math
 import os
 import random
 import re
@@ -9,8 +10,9 @@ import sys
 import tempfile
 import time
 import unicodedata
+from collections.abc import Callable
 from datetime import datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 import httpx
 import lxml.html as lh
@@ -25,6 +27,7 @@ from config.config import (
     LOG_FILE,
     MAX_EXPORTS,
     MAX_RETRIES,
+    MAX_RETRY_AFTER,
     PASSWORD,
     RETRY_DELAY,
     SERIES_LOOKUP_WORKERS,
@@ -33,7 +36,6 @@ from config.config import (
     setup_logging,
 )
 from src import term
-from src.term import cinput as input
 from src.term import cprint as print
 
 log = setup_logging()
@@ -134,8 +136,30 @@ def _retry_delay(resp: httpx.Response | None) -> float:
     if resp is not None:
         raw_value = resp.headers.get("Retry-After", "")
         with contextlib.suppress(ValueError):
-            base = max(float(raw_value), 0.0)
+            value = float(raw_value)
+            # float() also accepts "inf" and "nan". Neither is a wait anyone
+            # can sit through -- time.sleep(nan) raises from inside the retry
+            # handler -- so they count as malformed, like any other junk.
+            if math.isfinite(value):
+                base = max(value, 0.0)
     return base + random.uniform(0.0, RETRY_JITTER)
+
+
+# Every failure _api_request tries again. A transport error used to be retried
+# only if it was a timeout or a failed connect, so a connection the server
+# dropped mid-answer -- ReadError, or RemoteProtocolError's "Server
+# disconnected without sending a response", the usual end of a pooled
+# keep-alive connection the server already closed -- aborted a whole list
+# export, or silently lost one series' lookup, on the first occurrence.
+# NetworkError covers connect/read/write/close. Deliberately not every
+# TransportError: an unsupported protocol or a malformed request of our own
+# fails the same way however often it is sent.
+_RETRYABLE_ERRORS = (
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    httpx.RemoteProtocolError,
+    httpx.HTTPStatusError,
+)
 
 
 def _api_request(client: _ClientLike, method: str, url: str, **kwargs) -> httpx.Response:
@@ -145,7 +169,8 @@ def _api_request(client: _ClientLike, method: str, url: str, **kwargs) -> httpx.
     only status >= 500 triggered a retry, so a rate-limited response came
     straight back to the caller, whose raise_for_status() then crashed the
     whole run instead of backing off. Both cases honor a Retry-After header
-    when the server sends one.
+    when the server sends one -- up to MAX_RETRY_AFTER; a server asking for
+    longer than that fails the request at once instead of parking the run.
     """
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -157,13 +182,19 @@ def _api_request(client: _ClientLike, method: str, url: str, **kwargs) -> httpx.
                     response=resp,
                 )
             return resp
-        except (
-            httpx.TimeoutException,
-            httpx.ConnectError,
-            httpx.HTTPStatusError,
-        ) as exc:
+        except _RETRYABLE_ERRORS as exc:
             if attempt < MAX_RETRIES:
                 delay = _retry_delay(getattr(exc, "response", None))
+                # The jitter is ours, not the server's, so it does not count
+                # against the limit.
+                if delay > MAX_RETRY_AFTER + RETRY_JITTER:
+                    log.error(
+                        "Request failed: %s – the server asked to wait %.0fs, longer than the %ds limit; not retrying",
+                        exc,
+                        delay,
+                        MAX_RETRY_AFTER,
+                    )
+                    raise
                 log.warning(
                     "Request failed (attempt %d/%d): %s – retrying in %.0fs...",
                     attempt,
@@ -361,7 +392,9 @@ def _join_pages(pages: list[list], total: int) -> list[dict]:
     return items
 
 
-def _verify_page_total(items: list[dict], total: int, title: str, pages_fetched: int) -> None:
+def _verify_page_total(
+    items: list[dict], total: int, title: str, pages_fetched: int, site: str = "MangaUpdates"
+) -> None:
     """Refuse to hand back a list shorter than the list said it was.
 
     A short export is the one failure this module must never pass on
@@ -369,7 +402,8 @@ def _verify_page_total(items: list[dict], total: int, title: str, pages_fetched:
     against it and reports every item that was missing as removed from the
     account. _fetch_list_page already aborts rather than substitute a default
     for exactly that reason; this applies the same rule to the assembled
-    result, which is where a shortfall actually becomes visible.
+    result, which is where a shortfall actually becomes visible. Anime-Planet
+    lists go through the same check (`site` only changes the wording).
 
     The page-limit case stays a warning, not an error -- there the range was
     knowingly clamped and the shortfall is expected.
@@ -380,7 +414,7 @@ def _verify_page_total(items: list[dict], total: int, title: str, pages_fetched:
         log.warning("  %s: hit page limit (%d) – list may be incomplete", title, MAX_LIST_PAGES)
         return
     raise ValueError(
-        f"MangaUpdates returned an incomplete list for '{title}': "
+        f"{site} returned an incomplete list for '{title}': "
         f"{len(items)} of {total} item(s) across {pages_fetched} page(s). "
         "Nothing was saved — saving this would make the next run report the "
         "missing series as removed from your account."
@@ -437,7 +471,11 @@ def export_list(client: _ClientLike, list_id: int, title: str) -> list[dict]:
 
 def sanitize_filename(name: str) -> str:
     """Remove characters unsafe for filenames."""
-    safe = re.sub(r'[<>:"/\\|?*]', "_", name).strip().strip(".")
+    # Control characters (tab, newline, ...) are as invalid in a Windows
+    # filename as the punctuation is: a list title containing one reached
+    # open() unchanged and the save died with OSError 22 -- after every list
+    # had already been fetched.
+    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip().strip(".")
     # A single path component is capped at 255 UTF-16 units on NTFS (and
     # similar limits elsewhere). 100 codepoints stays well under that even
     # in the worst case -- a title made entirely of astral-plane characters
@@ -482,7 +520,12 @@ def export_filenames(titles) -> dict[str, str]:
     # write would silently land on the first list's file with no warning,
     # the exact corruption this manifest system exists to prevent, just via
     # a different door. Reproduced live before this fix.
-    used_ci: set[str] = set()
+    #
+    # The manifest's own name starts out taken. A list titled "_manifest" was
+    # given _manifest.json, and save_exports then wrote the manifest over it:
+    # the list's items were gone from the snapshot, and every later diff read
+    # the manifest back as that list's contents.
+    used_ci: set[str] = {os.path.splitext(MANIFEST_NAME)[0].lower()}
     for title in titles:
         base = sanitize_filename(title)
         name = base
@@ -495,6 +538,69 @@ def export_filenames(titles) -> dict[str, str]:
     return mapping
 
 
+class _ListIdentity(NamedTuple):
+    """What a list *is*, as opposed to the key its export is stored under.
+
+    The key is the title, suffixed " (2)" when two lists share one, and that
+    suffix is positional: delete the first of two "Reading" lists and the
+    second inherits the bare key. Diffing by key then compared the surviving
+    list against the deleted one's file and reported every series in both as
+    added and removed. The site's own id does not move like that.
+    """
+
+    list_id: Any
+    title: str
+
+
+class _ManifestEntry(NamedTuple):
+    """One list as an export folder's manifest records it."""
+
+    file: str
+    # None when the folder does not know it: a manifest written before ids
+    # were recorded, or a site (Anime-Planet) whose lists carry none. Unknown
+    # is not the same as different -- such a list is matched by title.
+    list_id: Any
+    title: str
+
+
+def _read_manifest(folder: str) -> dict[str, _ManifestEntry] | None:
+    """Every list an export folder holds, keyed as it was exported, or None.
+
+    Two shapes are understood. The first manifests mapped key -> filename and
+    nothing else; folders written since store an object per list that also
+    carries the list's id and real title. Reading both is what keeps every
+    existing export comparable after the upgrade.
+
+    None means there is no usable manifest at all -- a folder written before
+    manifests existed, or one whose manifest cannot be read -- and the caller
+    falls back to the filenames on disk.
+    """
+    try:
+        with open(os.path.join(folder, MANIFEST_NAME), encoding="utf-8") as f:
+            stored = json.load(f)
+    except (ValueError, OSError):  # ValueError covers bad JSON and bad UTF-8 alike
+        return None
+    if not isinstance(stored, dict) or not stored:
+        return None
+    entries: dict[str, _ManifestEntry] = {}
+    for key, value in stored.items():
+        if isinstance(value, str):
+            entries[key] = _ManifestEntry(value, None, key)
+        elif isinstance(value, dict) and isinstance(value.get("file"), str):
+            title = value.get("title")
+            list_id = value.get("list_id")
+            # An id is only usable as a matching key if it is a plain value;
+            # anything else is treated as unknown rather than trusted.
+            if isinstance(list_id, bool) or not isinstance(list_id, (int, str)):
+                list_id = None
+            entries[key] = _ManifestEntry(value["file"], list_id, title if isinstance(title, str) else key)
+        else:
+            # Half a manifest is worse than none: the entries it lost would
+            # be guessed from filenames while the rest were trusted.
+            return None
+    return entries
+
+
 def load_manifest(folder: str, titles) -> dict[str, str]:
     """Return the title -> filename mapping an export folder was written with.
 
@@ -503,18 +609,17 @@ def load_manifest(folder: str, titles) -> dict[str, str]:
     the wrong list. Falls back to recomputing for folders written before
     manifests existed.
     """
-    path = os.path.join(folder, MANIFEST_NAME)
-    try:
-        with open(path, encoding="utf-8") as f:
-            stored = json.load(f)
-        if isinstance(stored, dict) and stored:
-            return {str(k): str(v) for k, v in stored.items()}
-    except (json.JSONDecodeError, OSError):
-        pass
-    return export_filenames(titles)
+    manifest = _read_manifest(folder)
+    if manifest is None:
+        return export_filenames(titles)
+    return {key: entry.file for key, entry in manifest.items()}
 
 
-def save_exports(exports: dict[str, list[dict]], exports_dir: str | None = None) -> str:
+def save_exports(
+    exports: dict[str, list[dict]],
+    exports_dir: str | None = None,
+    identities: dict[str, _ListIdentity] | None = None,
+) -> str:
     """Save each list to a timestamped folder. Returns the folder path.
 
     exports_dir scopes the snapshot tree: option 1 uses the default
@@ -522,6 +627,11 @@ def save_exports(exports: dict[str, list[dict]], exports_dir: str | None = None)
     exports never diff against each other and rotation stays per site.
     None reads config's EXPORTS_DIR at call time -- a bound default would
     have frozen the import-time path and ignored every test/override.
+
+    identities, keyed like exports, records each list's id and real title in
+    the manifest so the next comparison can follow a list across a rename or
+    a shifted duplicate-title suffix. A list without one is stored with an
+    unknown id and matched by title, exactly as before ids were recorded.
     """
     if exports_dir is None:
         exports_dir = EXPORTS_DIR
@@ -577,8 +687,13 @@ def save_exports(exports: dict[str, list[dict]], exports_dir: str | None = None)
         _write_json(file_path, items)
         log.info("  Saved %s (%d items)", os.path.join(folder_path, f"{unique_title}.json"), len(items))
 
+    identities = identities or {}
+    manifest = {}
+    for title, filename in filenames.items():
+        identity = identities.get(title, _ListIdentity(None, title))
+        manifest[title] = {"file": filename, "list_id": identity.list_id, "title": identity.title}
     manifest_path = os.path.join(tmp_folder_path, MANIFEST_NAME)
-    _write_json(manifest_path, filenames)
+    _write_json(manifest_path, manifest)
 
     os.replace(tmp_folder_path, folder_path)
     return folder_path
@@ -631,6 +746,31 @@ def get_series_basic(items: list[dict]) -> dict[int, dict]:
     return result
 
 
+def _plan_list_keys(lists: list[dict]) -> list[tuple[str, Any, str]]:
+    """Each list's storage key, in list order: [(key, list_id, title), ...].
+
+    Keying `exports` by title alone would let the second list silently
+    overwrite the first one's data if two distinct lists (different list_id)
+    happen to share the same title, so a repeated title gets " (2)", " (3)".
+
+    Pure and silent, so run_scan_lists can ask for the same keys again to
+    record each list's id beside its export; export_all_lists does the
+    warning.
+    """
+    plan: list[tuple[str, Any, str]] = []
+    used_titles = set()
+    for lst in lists:
+        title = lst["title"]
+        key = title
+        counter = 2
+        while key in used_titles:
+            key = f"{title} ({counter})"
+            counter += 1
+        used_titles.add(key)
+        plan.append((key, lst["list_id"], title))
+    return plan
+
+
 def export_all_lists(client: _ClientLike, lists: list[dict]) -> dict[str, list[dict]]:
     """Export every list, guarding against two distinct lists sharing a title.
 
@@ -646,19 +786,8 @@ def export_all_lists(client: _ClientLike, lists: list[dict]) -> dict[str, list[d
     # warnings and the resulting key assignment stay exactly as they were --
     # the dedup counter depends on the order lists are seen in, and that must
     # not become a function of which request happens to finish first.
-    plan: list[tuple[str, int, str]] = []
-    used_titles = set()
-    for lst in lists:
-        list_id = lst["list_id"]
-        title = lst["title"]
-        # Keying `exports` by title alone would let the second list silently
-        # overwrite the first one's data if two distinct lists (different
-        # list_id) happen to share the same title.
-        key = title
-        counter = 2
-        while key in used_titles:
-            key = f"{title} ({counter})"
-            counter += 1
+    plan = _plan_list_keys(lists)
+    for key, list_id, title in plan:
         if key != title:
             log.warning(
                 "Duplicate list title '%s' (list_id=%s) – storing under '%s' to avoid data loss",
@@ -666,8 +795,6 @@ def export_all_lists(client: _ClientLike, lists: list[dict]) -> dict[str, list[d
                 list_id,
                 key,
             )
-        used_titles.add(key)
-        plan.append((key, list_id, title))
 
     if not plan:
         return {}
@@ -746,7 +873,22 @@ def fetch_series_related(client: _ClientLike, series_id: int) -> list[dict] | No
         return None
 
 
-def collect_related_series(client: _ClientLike, exports: dict[str, list[dict]]) -> dict[int, dict]:
+class _Lookups(NamedTuple):
+    """What one batch of per-series lookups found, and how many it could not make.
+
+    A lookup that failed used to vanish: the series was skipped, nothing was
+    counted, and the report went on to say "0 related series found" or
+    "0 finished out of 3 checked" -- reproduced with every lookup rate-limited,
+    which overwrote a good report with a confident and wrong one. `unchecked`
+    is what lets the report and the log say what was not looked at.
+    """
+
+    found: dict[int, dict]
+    total: int  # series the batch set out to look up
+    unchecked: int  # of those, how many came back with no answer (404 or failure)
+
+
+def collect_related_series(client: _ClientLike, exports: dict[str, list[dict]]) -> _Lookups:
     """Look up every series in every list and gather what is related but not already tracked.
 
     One hop only: a related series is found because it relates to a series
@@ -761,9 +903,10 @@ def collect_related_series(client: _ClientLike, exports: dict[str, list[dict]]) 
     not charge for this endpoint, and real pushback (429) is already handled
     by _api_request's own backoff regardless of how many threads are asking.
 
-    Returns {related_series_id: {"title", "url", "sources": [(origin_title,
-    relation_type), ...]}}, already excluding anything you already have in
-    any list and deduplicated across every series that pointed at it.
+    Returns _Lookups whose `found` is {related_series_id: {"title", "url",
+    "sources": [(origin_title, relation_type), ...]}}, already excluding
+    anything you already have in any list and deduplicated across every
+    series that pointed at it.
     """
     # Every series you already track, across every list -- computed once and
     # used both to know which ids to look up and which relations to exclude
@@ -777,6 +920,7 @@ def collect_related_series(client: _ClientLike, exports: dict[str, list[dict]]) 
     related: dict[int, dict] = {}
     total = len(all_ids)
     done = 0
+    unchecked = 0
 
     with _worker_pool(SERIES_LOOKUP_WORKERS) as pool:
         future_to_series = {
@@ -792,6 +936,7 @@ def collect_related_series(client: _ClientLike, exports: dict[str, list[dict]]) 
             relations = future.result()
             log.info("  [%d/%d] Checked related series for %s", done, total, origin_title)
             if relations is None:
+                unchecked += 1
                 continue
 
             for rel in relations:
@@ -808,10 +953,48 @@ def collect_related_series(client: _ClientLike, exports: dict[str, list[dict]]) 
                 )
                 entry["sources"].append((origin_title, rel.get("relation_type", "Related")))
 
-    return related
+    return _Lookups(related, total, unchecked)
 
 
-def save_related_series(related: dict[int, dict]) -> str:
+RELATED_REPORT_NAME = "related.txt"
+FINISHED_REPORT_NAME = "ready_to_read.txt"
+
+
+def _unchecked_line(unchecked: int) -> str:
+    """The report-header line naming lookups that came back with no answer."""
+    return f"  {unchecked} series could not be checked (lookup failed — see the log)"
+
+
+def _may_replace_report(path: str, lookups: _Lookups) -> bool:
+    """Whether this run's report may take the place of the one already at `path`.
+
+    The reports live at one fixed path and every run overwrote it, so a run
+    whose lookups failed replaced a good report with a worse one and said
+    nothing. A complete run still replaces it without asking -- that is what
+    the stable path is for -- and so does any run when there is nothing there
+    yet. Otherwise:
+
+    - every lookup failed: the new report knows nothing, so the previous one
+      is kept and the user is told, without a question to answer;
+    - some failed: the user decides. Only an explicit y replaces it; n, end
+      of input or a run of unusable answers keeps the previous report.
+    """
+    if lookups.unchecked == 0 or not os.path.exists(path):
+        return True
+    if lookups.unchecked >= lookups.total:
+        log.warning("Every lookup failed – keeping the previous report at %s unchanged", path)
+        return False
+    print(
+        f"\n  {lookups.unchecked} of {lookups.total} series could not be checked, so this report is incomplete."
+        f"\n  A previous report exists at {path}."
+    )
+    if term.confirm("Replace it with this incomplete report? (y/n): "):
+        return True
+    log.info("Kept the previous report at %s; this run's results were not saved", path)
+    return False
+
+
+def save_related_series(related: dict[int, dict], unchecked: int = 0) -> str:
     """Write the related-series report to a single, stable path.
 
     Every run overwrites the same file (exports/related.txt) rather than
@@ -821,10 +1004,14 @@ def save_related_series(related: dict[int, dict]) -> str:
     the same reason save_exports uses the same pattern: a crash mid-write
     must never leave a half-written related.txt in place of a good one.
 
+    `unchecked` series are named in the header, and an empty result no longer
+    claims "every related series found is already in one of your lists" when
+    some series were never looked at.
+
     The output uses the same box/card layout as save_finished_series so
     the two reports are visually consistent.
     """
-    path = os.path.join(EXPORTS_DIR, "related.txt")
+    path = os.path.join(EXPORTS_DIR, RELATED_REPORT_NAME)
     now = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
     inner_width = FINISHED_REPORT_WIDTH - 4  # "║  ...  ║"
 
@@ -833,11 +1020,14 @@ def save_related_series(related: dict[int, dict]) -> str:
         "║" + _pad_finished_line(f"  Related Series — {now}") + "║",
         _CARD_MID,
         "║" + _pad_finished_line(f"  {len(related)} related series found") + "║",
-        _CARD_BOTTOM,
-        "",
     ]
+    if unchecked:
+        lines.append("║" + _pad_finished_line(_unchecked_line(unchecked)) + "║")
+    lines += [_CARD_BOTTOM, ""]
 
-    if not related:
+    if not related and unchecked:
+        lines.append("  (none found among the series that could be checked)")
+    elif not related:
         lines.append("  (none — every related series found is already in one of your lists)")
     else:
         # Everything here was collected in as_completed order -- whichever
@@ -923,7 +1113,7 @@ def fetch_series_status(client: _ClientLike, series_id: int) -> dict | None:
         return None
 
 
-def find_finished_wishlist_series(client: _ClientLike, wish_items: list[dict]) -> dict[int, dict]:
+def find_finished_wishlist_series(client: _ClientLike, wish_items: list[dict]) -> _Lookups:
     """Check every series in the Wish List and return the ones that are finished.
 
     Concurrent across SERIES_LOOKUP_WORKERS threads, same pattern and same
@@ -931,12 +1121,15 @@ def find_finished_wishlist_series(client: _ClientLike, wish_items: list[dict]) -
     does not charge for it, and _api_request's own backoff is the real
     safety net rather than a fixed pace.
 
-    Returns {series_id: {"title", "url", "status"}}.
+    Returns _Lookups whose `found` is {series_id: {"title", "url", "status"}}.
+    A lookup that failed is counted in `unchecked`, never read as "not
+    finished".
     """
     basic = get_series_basic(wish_items)
     finished: dict[int, dict] = {}
     total = len(basic)
     done = 0
+    unchecked = 0
 
     with _worker_pool(SERIES_LOOKUP_WORKERS) as pool:
         future_to_series = {
@@ -947,11 +1140,14 @@ def find_finished_wishlist_series(client: _ClientLike, wish_items: list[dict]) -
             done += 1
             result = future.result()
             log.info("  [%d/%d] Checked status for %s", done, total, info["title"])
-            if result is None or not result["completed"]:
+            if result is None:
+                unchecked += 1
+                continue
+            if not result["completed"]:
                 continue
             finished[series_id] = {"title": info["title"], "url": info["url"], "status": result["status"]}
 
-    return finished
+    return _Lookups(finished, total, unchecked)
 
 
 # Width chosen so each card fits comfortably in an 80-column terminal.
@@ -1064,15 +1260,18 @@ def _split_finished_status(status_text: str) -> tuple[str, list[str]]:
     return first, parts[1:]
 
 
-def save_finished_series(finished: dict[int, dict], total_checked: int) -> str:
+def save_finished_series(finished: dict[int, dict], total_checked: int, unchecked: int = 0) -> str:
     """Write the finished-Wish-List report to a single, stable path.
 
     Same stable-path, atomic-overwrite pattern as save_related_series: one
     fixed file (exports/ready_to_read.txt) that always holds the newest run,
     not one per timestamped export folder. The output uses a box layout with
     one card per series so long status strings are readable.
+
+    `total_checked` counts the series that were actually answered; the
+    `unchecked` ones are named separately rather than folded into it.
     """
-    path = os.path.join(EXPORTS_DIR, "ready_to_read.txt")
+    path = os.path.join(EXPORTS_DIR, FINISHED_REPORT_NAME)
     now = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
     inner_width = FINISHED_REPORT_WIDTH - 4  # "║  ...  ║"
 
@@ -1081,11 +1280,14 @@ def save_finished_series(finished: dict[int, dict], total_checked: int) -> str:
         "║" + _pad_finished_line(f"  Finished Wish List Series — {now}") + "║",
         _CARD_MID,
         "║" + _pad_finished_line(f"  {len(finished)} series finished out of {total_checked} checked") + "║",
-        _CARD_BOTTOM,
-        "",
     ]
+    if unchecked:
+        lines.append("║" + _pad_finished_line(_unchecked_line(unchecked)) + "║")
+    lines += [_CARD_BOTTOM, ""]
 
-    if not finished:
+    if not finished and unchecked:
+        lines.append("  None of the Wish List series that could be checked have finished releasing yet.")
+    elif not finished:
         lines.append("  No Wish List series have finished releasing yet.")
     else:
         # Sort by title; use the series id to break ties into a total order.
@@ -1195,33 +1397,103 @@ def find_previous_export(current_folder: str) -> str | None:
     return None
 
 
-def _load_prev_exports(prev_folder: str, titles: list[str]) -> tuple[dict[str, list[dict]], set[str]]:
-    """Load previous exports. Returns ({list_title: raw items}, unreadable titles).
+class _PreviousLists(NamedTuple):
+    """How the previous export's lists line up with this run's."""
 
-    Reads the manifest once and returns the raw items rather than an
-    already-reduced id map, so compare_exports can do both the movement scan
-    and the per-list diff from one read of each file instead of two.
+    # current key -> the file that held this same list last time
+    files: dict[str, str]
+    # current key -> the list's title last time, for a list renamed since
+    renamed: dict[str, str]
+    # previous key -> entry, for every previous list nothing current matched
+    gone: dict[str, _ManifestEntry]
+
+
+def _match_previous_lists(prev_folder: str, current: dict[str, _ManifestEntry]) -> _PreviousLists:
+    """Pair each list of this run with the previous export's file for the same list.
+
+    Lists used to be paired by title -- or rather by key and filename, with a
+    sanitize_filename() guess for any title the previous manifest did not
+    know. That went wrong three ways, all reproduced: deleting the first of
+    two same-titled lists moved the second onto the bare key and diffed it
+    against the deleted list's file; a case-only rename ("Sci-fi" ->
+    "Sci-Fi") found the old file through NTFS's case-insensitivity and
+    reported "No changes" and "LIST REMOVED" for the same list; and removed
+    lists were detected by filename, so the survivor of two colliding titles
+    could be the one reported gone.
+
+    Now a list is matched by its site id where both sides know it, then by
+    key only where at least one side does not -- an older manifest, or a site
+    without ids -- and never across two known, different ids. A key the
+    previous manifest does not list is a new list, not a filename to guess.
+    """
+    previous = _read_manifest(prev_folder)
+    if previous is None:
+        # A folder from before manifests existed: no titles, no ids, only
+        # files. It was written with the filenames this run derives from the
+        # same titles, so pair on those, as it always was.
+        stems = [name[:-5] for name in os.listdir(prev_folder) if name.endswith(".json") and name != MANIFEST_NAME]
+        derived = export_filenames(list(current))
+        files = {key: derived[key] for key in current if derived[key] in stems}
+        paired = set(files.values())
+        gone = {stem: _ManifestEntry(stem, None, stem) for stem in sorted(stems) if stem not in paired}
+        return _PreviousLists(files, {}, gone)
+
+    files: dict[str, str] = {}
+    renamed: dict[str, str] = {}
+    claimed: set[str] = set()
+
+    by_id = {entry.list_id: prev_key for prev_key, entry in previous.items() if entry.list_id is not None}
+    for key, entry in current.items():
+        prev_key = by_id.get(entry.list_id) if entry.list_id is not None else None
+        if prev_key is None or prev_key in claimed:
+            continue
+        files[key] = previous[prev_key].file
+        claimed.add(prev_key)
+        # Only an id match can tell a rename from a new list. The key cannot:
+        # an older manifest recorded no real title, so "Reading (2)" would
+        # read as renamed from itself the first time it was compared.
+        if previous[prev_key].title != entry.title:
+            renamed[key] = previous[prev_key].title
+
+    for key, entry in current.items():
+        if key in files or key in claimed or key not in previous:
+            continue
+        if entry.list_id is not None and previous[key].list_id is not None:
+            continue  # same key, two different lists: the old one is gone
+        files[key] = previous[key].file
+        claimed.add(key)
+
+    gone = {prev_key: entry for prev_key, entry in previous.items() if prev_key not in claimed}
+    return _PreviousLists(files, renamed, gone)
+
+
+def _load_prev_exports(prev_folder: str, files: dict[str, str]) -> tuple[dict[str, list[dict]], set[str]]:
+    """Load previous exports. Returns ({list_key: raw items}, unreadable keys).
+
+    `files` maps each list to the file that held it in prev_folder -- what
+    _match_previous_lists worked out, or load_manifest for a folder read
+    back on its own. Returns the raw items rather than an already-reduced id
+    map, so compare_exports can do both the movement scan and the per-list
+    diff from one read of each file instead of two.
 
     A file that exists but cannot be parsed used to be substituted with an
     empty list, which made a corrupted export indistinguishable from a list
     that genuinely had nothing in it: every series in it came back reported
     as newly Added. That is the worst kind of wrong answer here, because it
-    looks exactly like a real account change. Those titles are named
+    looks exactly like a real account change. Those keys are named
     separately now so the caller can say it does not know, instead of
-    guessing.
+    guessing -- and so is a file the manifest names but that is missing.
     """
     result: dict[str, list[dict]] = {}
     unreadable: set[str] = set()
-    filenames = load_manifest(prev_folder, titles)
-    for title in titles:
-        prev_file = os.path.join(prev_folder, f"{filenames.get(title, sanitize_filename(title))}.json")
-        if os.path.isfile(prev_file):
-            try:
-                with open(prev_file, encoding="utf-8") as f:
-                    result[title] = json.load(f)
-            except (json.JSONDecodeError, OSError) as exc:
-                log.warning("Could not read '%s' from the previous export: %s", title, exc)
-                unreadable.add(title)
+    for key, filename in files.items():
+        prev_file = os.path.join(prev_folder, f"{filename}.json")
+        try:
+            with open(prev_file, encoding="utf-8") as f:
+                result[key] = json.load(f)
+        except (ValueError, OSError) as exc:  # ValueError covers bad JSON and bad UTF-8 alike
+            log.warning("Could not read '%s' from the previous export: %s", key, exc)
+            unreadable.add(key)
     return result, unreadable
 
 
@@ -1251,11 +1523,29 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
     ):
         log.info(line)
 
+    # Which previous list is which current list. Read from the manifest
+    # save_exports already wrote for this run -- one source of truth for the
+    # ids and files this folder actually uses.
+    current_manifest = _read_manifest(current_folder) or {}
+    current = {key: current_manifest.get(key, _ManifestEntry("", None, key)) for key in exports}
+    match = _match_previous_lists(prev_folder, current)
+
     # Load every previous list once; both the movement scan and the
     # per-list diff below read from this instead of the file a second time.
-    all_titles = list(exports.keys())
-    prev_by_list, unreadable = _load_prev_exports(prev_folder, all_titles)
+    # Lists that are gone are loaded too: a series that moved out of a list
+    # which no longer exists was reported as newly Added, because only the
+    # lists still present were ever read.
+    prev_by_list, unreadable = _load_prev_exports(prev_folder, match.files)
+    gone_by_list, _gone_unreadable = _load_prev_exports(prev_folder, {k: e.file for k, e in match.gone.items()})
     prev_ids_by_list = {title: get_series_ids(items) for title, items in prev_by_list.items()}
+    gone_ids_by_list = {title: get_series_ids(items) for title, items in gone_by_list.items()}
+    # A gone list's key can equal a current one -- the survivor of two
+    # same-titled lists inherits the bare title -- so where both exist the
+    # gone one is named by its id, in moves and in the removal line alike.
+    gone_label = {
+        key: f"{key} (list_id {entry.list_id})" if key in exports and entry.list_id is not None else key
+        for key, entry in match.gone.items()
+    }
 
     # get_series_ids(items) used to be called separately for the movement
     # scan, again per moved series (re-scanning every list from scratch to
@@ -1263,10 +1553,16 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
     # same list. Computed once here and reused everywhere.
     cur_ids_by_list = {title: get_series_ids(items) for title, items in exports.items()}
 
-    prev_sid_to_list: dict[int, str] = {}
+    # Where each series was last time: (list name, whether that list is gone).
+    # The flag, not the name, says a gone list was left: its name can equal a
+    # current list's, and a name comparison alone would then miss the move.
+    prev_sid_to_list: dict[int, tuple[str, bool]] = {}
+    for list_title, ids in gone_ids_by_list.items():
+        for sid in ids:
+            prev_sid_to_list[sid] = (gone_label[list_title], True)
     for list_title, ids in prev_ids_by_list.items():
         for sid in ids:
-            prev_sid_to_list[sid] = list_title
+            prev_sid_to_list[sid] = (list_title, False)
 
     cur_sid_to_list: dict[int, str] = {}
     cur_sid_to_name: dict[int, str] = {}
@@ -1278,8 +1574,11 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
     # Detect movements (series that changed lists)
     moved: dict[int, tuple[str, str, str]] = {}  # sid -> (title, old_list, new_list)
     for sid, new_list in cur_sid_to_list.items():
-        old_list = prev_sid_to_list.get(sid)
-        if old_list and old_list != new_list:
+        old = prev_sid_to_list.get(sid)
+        if old is None:
+            continue
+        old_list, old_list_gone = old
+        if old_list_gone or old_list != new_list:
             moved[sid] = (cur_sid_to_name[sid], old_list, new_list)
 
     has_changes = False
@@ -1302,6 +1601,14 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
     moved_sids = set(moved.keys())
 
     for title, current_items in exports.items():
+        if title in match.renamed:
+            has_changes = True
+            log.info(
+                "  %s  %s",
+                term.accent("✎"),
+                term.accent(f"[{title}] renamed (was '{match.renamed[title]}')"),
+            )
+
         if title in unreadable:
             # Not reported as added/removed: we do not know what was there.
             has_changes = True
@@ -1375,26 +1682,24 @@ def compare_exports(current_folder: str, exports: dict[str, list[dict]]) -> bool
         for sid in sorted(removed_ids, key=lambda s: (prev_ids[s].lower(), s)):
             log.info("     %s Removed: %s", term.warn("-"), prev_ids[sid])
 
-    # Check for lists that existed before but are now gone. Read the
-    # previous folder's own manifest for this -- comparing against the
-    # *current* titles' filenames would use the current run's dedup order,
-    # which does not necessarily match the one the previous folder was
-    # written with if list ordering changed between runs.
-    prev_manifest = load_manifest(prev_folder, [])
-    if not prev_manifest:
-        prev_manifest = {f[:-5]: f[:-5] for f in os.listdir(prev_folder) if f.endswith(".json") and f != MANIFEST_NAME}
-    # Read the manifest save_exports already wrote for this run, rather than
-    # recomputing it -- one source of truth for what filenames this folder
-    # actually uses.
-    current_filenames = set(load_manifest(current_folder, list(exports.keys())).values())
-    for prev_title, prev_filename in prev_manifest.items():
-        if prev_filename not in current_filenames:
-            has_changes = True
-            log.info(
-                "  %s  %s",
-                term.warn("✗"),
-                term.warn(f"[{prev_title}] LIST REMOVED (no longer exists)"),
-            )
+    # Lists that existed before and matched nothing this time. The series
+    # they held are listed, less any that moved to a list still present --
+    # those were reported as moves above.
+    for prev_title in match.gone:
+        has_changes = True
+        label = gone_label[prev_title]
+        gone_ids = gone_ids_by_list.get(prev_title)
+        if gone_ids is None:
+            log.info("  %s  %s", term.warn("✗"), term.warn(f"[{label}] LIST REMOVED (no longer exists)"))
+            continue
+        left = {sid: name for sid, name in gone_ids.items() if sid not in moved_sids}
+        log.info(
+            "  %s  %s",
+            term.warn("✗"),
+            term.warn(f"[{label}] LIST REMOVED (no longer exists) – {len(gone_ids)} item(s)"),
+        )
+        for sid in sorted(left, key=lambda s: (left[s].lower(), s)):
+            log.info("     %s Removed: %s", term.warn("-"), left[sid])
 
     if not has_changes:
         log.info("")
@@ -1472,7 +1777,10 @@ def run_scan_lists(client: _ClientLike) -> None:
     exports = export_all_lists(client, lists)
 
     log.info("Saving exports...")
-    folder = save_exports(exports)
+    # The same keys export_all_lists stored the lists under, with each one's
+    # id, so the next run can tell a list apart from another of the same name.
+    identities = {key: _ListIdentity(list_id, title) for key, list_id, title in _plan_list_keys(lists)}
+    folder = save_exports(exports, identities=identities)
     log.info("Exports saved to: %s", folder)
 
     try:
@@ -1508,9 +1816,27 @@ def run_related_check(client: _ClientLike) -> None:
     exports = export_all_lists(client, lists)
 
     log.info("Checking related series...")
-    related = collect_related_series(client, exports)
-    related_path = save_related_series(related)
-    log.info("Related series report saved to: %s (%d found)", related_path, len(related))
+    lookups = collect_related_series(client, exports)
+    _report_unchecked(lookups)
+    path = os.path.join(EXPORTS_DIR, RELATED_REPORT_NAME)
+    if not _may_replace_report(path, lookups):
+        return
+    related_path = save_related_series(lookups.found, lookups.unchecked)
+    log.info("Related series report saved to: %s (%d found)", related_path, len(lookups.found))
+
+
+def _report_unchecked(lookups: _Lookups) -> None:
+    """Say in the log how many lookups came back with no answer, if any did.
+
+    Each failure is already logged as it happens, but one line per series
+    scrolls away in a run of hundreds; this is the count that stays visible.
+    """
+    if lookups.unchecked:
+        log.warning(
+            "%d of %d series could not be checked (lookup failed — see the warnings above)",
+            lookups.unchecked,
+            lookups.total,
+        )
 
 
 def run_finished_check(client: _ClientLike) -> None:
@@ -1538,9 +1864,16 @@ def run_finished_check(client: _ClientLike) -> None:
         return
 
     log.info("Checking which Wish List series have finished releasing...")
-    finished = find_finished_wishlist_series(client, items)
-    path = save_finished_series(finished, len(items))
-    log.info("Ready-to-read report saved to: %s (%d of %d found)", path, len(finished), len(items))
+    lookups = find_finished_wishlist_series(client, items)
+    _report_unchecked(lookups)
+    path = os.path.join(EXPORTS_DIR, FINISHED_REPORT_NAME)
+    if not _may_replace_report(path, lookups):
+        return
+    # "Out of N checked" counts the series that were answered. It used to be
+    # len(items), which counted a failed lookup as checked and not finished.
+    checked = lookups.total - lookups.unchecked
+    path = save_finished_series(lookups.found, checked, lookups.unchecked)
+    log.info("Ready-to-read report saved to: %s (%d of %d found)", path, len(lookups.found), checked)
 
 
 # ==================== Anime-Planet ====================
@@ -1594,7 +1927,10 @@ class _AnimePlanetClient:
 
     def get(self, path: str, params: dict[str, Any] | None = None) -> httpx.Response:
         url = f"{AP_BASE_URL}{path}" if path.startswith("/") else f"{AP_BASE_URL}/{path}"
-        return self.client.get(url, params=params)
+        # Through the same retry as every MangaUpdates request. This went out
+        # bare, so one 429 from the site -- or a dropped connection, with up
+        # to LIST_PAGE_WORKERS pages in flight -- ended option 4 at once.
+        return _api_request(self.client, "get", url, params=params)
 
     def close(self) -> None:
         self.client.close()
@@ -1610,14 +1946,32 @@ def _ap_list_path(username: str, list_type: str) -> str:
     return f"/users/{username}/{list_type}"
 
 
+def _ap_profile_error(position: int, detail: str) -> ValueError:
+    """A profile list entry that cannot be read, said in a way that names it."""
+    return ValueError(
+        f"Anime-Planet profile list entry {position} {detail}. Nothing was saved — exporting "
+        "without that list would make the next run report everything in it as removed."
+    )
+
+
 def _ap_parse_profile_list_counts(page_html: str) -> list[tuple[str, str, str, int]]:
-    """Parse the profile statLists and return non-empty lists.
+    """Parse the profile statLists and return every list they count.
 
     The profile carries one statList per section (manga, anime); reading only
     the first would have silently dropped every anime list of an account
     with both. Returns tuples of (list_type, relative_url, label, count).
-    Only lists with a non-zero count are returned so the scraper can skip
-    empty ones entirely.
+
+    Empty lists are returned too, with a count of 0. They used to be left
+    out, so a list emptied since the last run -- the last manga in Reading
+    finished and moved to Read -- vanished from the export: the diff called
+    it "LIST REMOVED (no longer exists)" and reported the move as an Add.
+
+    A list entry whose link or count cannot be read stops the parse with a
+    ValueError instead of being skipped. Skipping left that list out of the
+    export with nothing on screen, and the next comparison reported it, and
+    every title in it, as removed -- the same reason fetch_lists refuses a
+    malformed MangaUpdates list index. The label span is not required: the
+    label comes from AP_LIST_TYPES or the URL, never from the page.
     """
     results: list[tuple[str, str, str, int]] = []
     if not page_html or not page_html.strip():
@@ -1628,26 +1982,24 @@ def _ap_parse_profile_list_counts(page_html: str) -> list[tuple[str, str, str, i
         for stat_list in doc.xpath('//ul[contains(@class, "statList")]')
         for li in stat_list.xpath('.//li[contains(@class, "status")]')
     ]
-    for item in items:
+    for position, item in enumerate(items, 1):
         link = item.xpath("./a")
-        if not link:
-            continue
-        anchor = link[0]
-        href = anchor.get("href", "")
+        href = link[0].get("href", "") if link else ""
         if not href:
-            continue
-        count_text = anchor.xpath('.//span[@class="slCount"]/text()')
-        label_text = anchor.xpath('.//span[@class="slLabel"]/text()')
-        if not count_text or not label_text:
-            continue
+            raise _ap_profile_error(position, "has no link to its list")
+        count_text = link[0].xpath('.//span[@class="slCount"]/text()')
+        if not count_text:
+            raise _ap_profile_error(position, f"({href}) shows no item count")
         # Anime-Planet formats counts in the thousands with a comma
         # ("1,234"); int() rejects that and would silently drop the list.
         try:
             count = int(count_text[0].strip().replace(",", ""))
         except ValueError:
-            continue
-        if count <= 0:
-            continue
+            raise _ap_profile_error(
+                position, f"({href}) has an unreadable item count {count_text[0].strip()!r}"
+            ) from None
+        if count < 0:
+            raise _ap_profile_error(position, f"({href}) has a negative item count ({count})")
         # Map the URL tail back to the canonical list type key.
         key = href.lstrip("/")
         if key.startswith("users/"):
@@ -1719,6 +2071,13 @@ def _ap_parse_list_entries(page_html: str) -> list[dict]:
     return entries
 
 
+# The page size asked for, and the one the site serves when it ignores
+# per_page -- its own default, which is also why per_page is left off the URL
+# when it equals this.
+_AP_PER_PAGE = 560
+_AP_SITE_PER_PAGE = 35
+
+
 def _ap_fetch_list_page(
     ap_client: _AnimePlanetClient, username: str, list_type: str, page: int, per_page: int
 ) -> list[dict]:
@@ -1726,7 +2085,7 @@ def _ap_fetch_list_page(
     params = {}
     if page > 1:
         params["page"] = page
-    if per_page != 35:
+    if per_page != _AP_SITE_PER_PAGE:
         params["per_page"] = per_page
     resp = ap_client.get(_ap_list_path(username, list_type), params=params)
     resp.raise_for_status()
@@ -1739,34 +2098,82 @@ def _ap_pages_needed(count: int, per_page: int) -> int:
     return max(1, (count + per_page - 1) // per_page)
 
 
-def _ap_fetch_all_list_entries(ap_client: _AnimePlanetClient, username: str, list_type: str, count: int) -> list[dict]:
-    """Fetch every page of an Anime-Planet list and return the entries."""
-    per_page = 560
-    pages = _ap_pages_needed(count, per_page)
+def _ap_unique_entries(pages: list[list[dict]]) -> list[dict]:
+    """Concatenate pages in order, keeping the first copy of each id.
+
+    A page asked for past the real end can come back as a repeat of an
+    earlier one rather than empty. Counted twice, those repeats could make a
+    short list look complete; a list holds each title once, so a repeated id
+    is never a second entry.
+    """
+    seen: set[Any] = set()
     entries: list[dict] = []
-    if pages == 0:
-        return entries
-    if pages == 1:
-        entries.extend(_ap_fetch_list_page(ap_client, username, list_type, 1, per_page))
-        return entries
-    jobs = [(username, list_type, page, per_page) for page in range(1, pages + 1)]
-    with _worker_pool(min(LIST_PAGE_WORKERS, len(jobs))) as pool:
-        # pool.map keeps page order, the way export_list assembles MangaUpdates
-        # pages; the earlier as_completed loop appended in completion order,
-        # so a large list's items landed in the export in a different order
-        # every run and the diffs read as huge spurious changes.
-        for page_entries in pool.map(lambda job: _ap_fetch_list_page(ap_client, *job), jobs):
-            entries.extend(page_entries)
+    for page in pages:
+        for entry in page:
+            series = _extract_series(entry)
+            sid = series.get("id") if series else None
+            if sid in seen:
+                continue
+            seen.add(sid)
+            entries.append(entry)
+    return entries
+
+
+def _ap_fetch_all_list_entries(
+    ap_client: _AnimePlanetClient, username: str, list_type: str, count: int, label: str | None = None
+) -> list[dict]:
+    """Fetch every page of an Anime-Planet list and return the entries.
+
+    Page 1 is fetched alone, because its length is the page size the site
+    actually serves. The page count used to be worked out from the 560 that
+    was asked for, so a site serving fewer per page left every entry past
+    page 1's worth out of the export -- with only a warning, while the short
+    list was saved as complete and the next diff reported the rest removed.
+
+    A page 1 shorter than the site's own default page while the list holds
+    more cannot be a page-size cap -- the page is broken (a bot-check or
+    private-list page, or cards that no longer parse) -- so nothing more is
+    fetched. Either way, a list still short of the profile's count raises
+    through _verify_page_total, the same rule MangaUpdates lists follow.
+    """
+    if count <= 0:
+        return []
+    first = _ap_fetch_list_page(ap_client, username, list_type, 1, _AP_PER_PAGE)
+    page_size = len(first)
+    pages = 1
+    later: list[list[dict]] = []
+    if _AP_SITE_PER_PAGE <= page_size < count:
+        pages = min(MAX_LIST_PAGES, _ap_pages_needed(count, page_size))
+        jobs = list(range(2, pages + 1))
+        with _page_pool(len(jobs)) as pool:
+            # pool.map keeps page order, the way export_list assembles
+            # MangaUpdates pages; the earlier as_completed loop appended in
+            # completion order, so a large list's items landed in the export
+            # in a different order every run and the diffs read as huge
+            # spurious changes.
+            later = list(
+                pool.map(lambda page: _ap_fetch_list_page(ap_client, username, list_type, page, _AP_PER_PAGE), jobs)
+            )
+    entries = _ap_unique_entries([first, *later])
+    _verify_page_total(entries, count, label or list_type, pages, site="Anime-Planet")
     return entries
 
 
 def _ap_export_all_lists(ap_client: _AnimePlanetClient, username: str) -> dict[str, list[dict]]:
-    """Export every non-empty Anime-Planet list for a user."""
+    """Export every Anime-Planet list the user's profile counts, empty ones included."""
     log.info("Fetching Anime-Planet profile for '%s'...", username)
     profile_resp = ap_client.get(_ap_user_profile_path(username))
+    if profile_resp.status_code == 404:
+        # Said plainly: this used to surface as "Could not reach Anime-Planet",
+        # which sent the user looking at their connection, not at a typo.
+        raise ValueError(f"Anime-Planet has no user named '{username}' — check AP_USERNAME in your .env")
     profile_resp.raise_for_status()
     list_infos = _ap_parse_profile_list_counts(profile_resp.text)
-    if not list_infos:
+    # Every list empty is treated as nothing to export, as it was before empty
+    # lists were kept: a profile page reading all zeros is far more likely a
+    # page that did not show the counts than an account emptied overnight,
+    # and saving it would report every title as removed.
+    if not any(count for _key, _href, _label, count in list_infos):
         log.warning("No non-empty Anime-Planet lists found for '%s'", username)
         return {}
 
@@ -1776,8 +2183,8 @@ def _ap_export_all_lists(ap_client: _AnimePlanetClient, username: str) -> dict[s
     # fetch_lists for MangaUpdates lists.
     log.info(
         "Found %d non-empty list(s): %s",
-        len(list_infos),
-        ", ".join(label for _key, _href, label, _count in list_infos),
+        sum(1 for _key, _href, _label, count in list_infos if count),
+        ", ".join(label for _key, _href, label, count in list_infos if count),
     )
 
     log.info("Exporting lists...")
@@ -1806,19 +2213,11 @@ def _ap_export_all_lists(ap_client: _AnimePlanetClient, username: str) -> dict[s
             )
         used_labels.add(key)
 
-        items = _ap_fetch_all_list_entries(ap_client, username, list_type, count)
+        # A shortfall raises inside, and the whole run stops before anything
+        # is saved -- the previous export stays the one the next run compares
+        # against. An empty list costs no request and is kept as [].
+        items = _ap_fetch_all_list_entries(ap_client, username, list_type, count, label)
         log.info("  %s: %d item(s)", label, len(items))
-        if len(items) < count:
-            # The site may cap per_page below what was asked, so a shortfall
-            # is not fatal -- but it must not pass unnoticed: the next run
-            # would diff against the short list and report the missing items
-            # as removed from the account.
-            log.warning(
-                "  %s: got %d of the %d item(s) the profile reported – list may be incomplete",
-                label,
-                len(items),
-                count,
-            )
         exports[key] = items
     return exports
 
@@ -1833,6 +2232,10 @@ def run_anime_planet_scan(client: _ClientLike) -> None:
     ap_client = _AnimePlanetClient()
     try:
         exports = _ap_export_all_lists(ap_client, AP_USERNAME)
+    except httpx.HTTPStatusError as exc:
+        # The site answered, so "could not reach" would point the wrong way.
+        log.error("Anime-Planet answered HTTP %d for %s", exc.response.status_code, exc.request.url)
+        return
     except httpx.HTTPError as exc:
         log.error("Could not reach Anime-Planet: %s", exc)
         return
@@ -1866,6 +2269,32 @@ def run_anime_planet_scan(client: _ClientLike) -> None:
         log.info(line)
 
 
+def _session_rejected(exc: BaseException) -> bool:
+    """Whether MangaUpdates answered 401: it no longer accepts the session token."""
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 401
+
+
+def _run_option(client: httpx.Client, action: Callable[[httpx.Client], None]) -> None:
+    """Run one menu option, logging in again once if the session was rejected.
+
+    The token from login() was set once and used for the whole session, so a
+    menu left open long enough for it to lapse failed every option after
+    that -- each with "You are still logged in" printed under it. A 401 now
+    gets one fresh login and one more attempt. Every option only reads from
+    MangaUpdates and saves atomically, so running it again is safe.
+    """
+    try:
+        action(client)
+    except httpx.HTTPStatusError as exc:
+        if not _session_rejected(exc):
+            raise
+        log.warning("MangaUpdates no longer accepts this session (HTTP 401) – logging in again and retrying once")
+        # The stale token must not ride along on the login request itself.
+        client.headers.pop("Authorization", None)
+        client.headers["Authorization"] = f"Bearer {login(client)}"
+        action(client)
+
+
 def main():
     print_header()
 
@@ -1896,10 +2325,18 @@ def main():
             while True:
                 show_menu()
                 try:
-                    choice = input("Enter your choice (0-4): ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    # Ctrl+C or a closed stdin at the prompt is a way of
-                    # saying "done", not a crash worth a traceback.
+                    # Only the offered numbers are answers; anything else is
+                    # asked again. A closed stdin, or a run of unusable
+                    # answers, gives "0" -- the choice that changes nothing.
+                    choice = term.ask(
+                        "Enter your choice (0-4): ",
+                        ("0", *actions),
+                        safe="0",
+                        hint="type a number between 0 and 4",
+                    )
+                except KeyboardInterrupt:
+                    # Ctrl+C at the prompt is a way of saying "done", not a
+                    # crash worth a traceback.
                     print()
                     log.info("Goodbye!")
                     break
@@ -1908,13 +2345,8 @@ def main():
                     log.info("Goodbye!")
                     break
 
-                action = actions.get(choice)
-                if action is None:
-                    print("✗ Invalid choice. Please enter a number between 0 and 4.")
-                    continue
-
                 try:
-                    action(client)
+                    _run_option(client, actions[choice])
                 except KeyboardInterrupt:
                     # Interrupt the operation, not the session -- the same
                     # thing Ctrl+C does at any other interactive prompt.
@@ -1930,7 +2362,13 @@ def main():
                     # The full traceback still goes to the log file.
                     log.error("Option %s failed: %s", choice, exc, exc_info=True)
                     print(f"\n✗ That option did not finish: {exc}")
-                    print("  You are still logged in — pick another option, or 0 to quit.")
+                    if _session_rejected(exc):
+                        # _run_option already logged in again once; a second
+                        # rejection is not something another try will fix.
+                        print("  MangaUpdates rejected the session even after logging in again.")
+                        print("  Enter 0 to quit, then start the program again.")
+                    else:
+                        print("  You are still logged in — pick another option, or 0 to quit.")
                     print(f"  Full detail is in {LOG_FILE}")
         finally:
             logout(client)

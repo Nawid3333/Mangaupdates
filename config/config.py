@@ -105,6 +105,12 @@ ITEMS_PER_PAGE = 100  # Items per API page request
 # Retry settings
 MAX_RETRIES = 3  # Number of retry attempts for API requests
 RETRY_DELAY = 5  # Seconds between retries
+# The longest Retry-After this program will sit through before a retry. A
+# server asking for longer is not going to recover within one run, and the
+# wait was unbounded: "Retry-After: 86400" slept every worker thread for a
+# day with nothing on screen but one warning -- and Ctrl+C did not help,
+# because the interpreter joins sleeping pool threads before it exits.
+MAX_RETRY_AFTER = 120
 
 # Related-series lookup settings
 # One GET /series/{id} request is made per unique series in your lists, run
